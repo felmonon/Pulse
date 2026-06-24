@@ -7,7 +7,14 @@ import AppKit
 
 @main
 struct MacMonitorApp: App {
-    @StateObject private var statsController = PulseStatsController()
+    @StateObject private var statsController: PulseStatsController
+    @StateObject private var islandController: DynamicIslandController
+
+    init() {
+        let stats = PulseStatsController()
+        _statsController = StateObject(wrappedValue: stats)
+        _islandController = StateObject(wrappedValue: DynamicIslandController(statsController: stats))
+    }
 
     var body: some Scene {
         WindowGroup {
@@ -15,14 +22,14 @@ struct MacMonitorApp: App {
                 .environmentObject(statsController)
         }
         .windowStyle(.hiddenTitleBar)
-        .defaultSize(width: 420, height: 480)
+        .defaultSize(width: 440, height: 460)
 
         Window("Settings", id: PulseSettings.settingsWindowID) {
             PulseSettingsView()
                 .environmentObject(statsController)
         }
         .windowStyle(.hiddenTitleBar)
-        .defaultSize(width: 420, height: 400)
+        .defaultSize(width: 440, height: 440)
         .windowResizability(.contentSize)
 
         MenuBarExtra {
@@ -163,6 +170,129 @@ final class PulseStatsController: ObservableObject {
     }
 }
 
+extension Notification.Name {
+    /// Posted when the Dynamic Island enablement setting changes (from the
+    /// Settings window or the menu-bar toggle) so the controller re-evaluates.
+    static let pulseIslandSettingChanged = Notification.Name("pulseIslandSettingChanged")
+}
+
+// MARK: - Dynamic Island Controller
+/// Owns the `DynamicIslandPanel` lifecycle: creates/shows it when the user
+/// enables the setting AND a notch is present; tears it down otherwise.
+/// Observes screen-layout and active-space changes so the panel stays
+/// anchored and hides under fullscreen apps.
+@MainActor
+final class DynamicIslandController: ObservableObject {
+    @Published private(set) var isExpanded = false
+    @Published private(set) var notchPresent: Bool
+
+    private let statsController: PulseStatsController
+    private var panel: DynamicIslandPanel?
+    private var screenObserver: NSObjectProtocol?
+    private var spaceObserver: NSObjectProtocol?
+    private var settingObserver: NSObjectProtocol?
+
+    init(statsController: PulseStatsController) {
+        self.statsController = statsController
+        self.notchPresent = DynamicIslandPanel.notchIsPresent
+        observeScreenChanges()
+        observeActiveSpace()
+        observeSettingChanges()
+        applyVisibility()
+    }
+
+    deinit {
+        if let screenObserver { NotificationCenter.default.removeObserver(screenObserver) }
+        if let spaceObserver { NSWorkspace.shared.notificationCenter.removeObserver(spaceObserver) }
+        if let settingObserver { NotificationCenter.default.removeObserver(settingObserver) }
+    }
+
+    /// Re-evaluate notch + setting, then show or hide.
+    func applyVisibility() {
+        notchPresent = DynamicIslandPanel.notchIsPresent
+        let enabled = PulseSharedSettings.defaults.bool(forKey: PulseSharedSettings.Keys.islandEnabled)
+
+        if enabled && notchPresent {
+            ensurePanelShown()
+            refreshFullscreenHiding()
+        } else {
+            teardownPanel()
+        }
+    }
+
+    private func ensurePanelShown() {
+        if panel == nil {
+            let rootView = DynamicIslandView(
+                statsController: statsController,
+                isExpanded: Binding(
+                    get: { [weak self] in self?.isExpanded ?? false },
+                    set: { [weak self] newValue in self?.setExpanded(newValue) }
+                )
+            )
+            let newPanel = DynamicIslandPanel(rootView: rootView)
+            newPanel.onCollapse = { [weak self] in self?.setExpanded(false) }
+            panel = newPanel
+        }
+        panel?.show()
+    }
+
+    /// Single mutation point for the published expand state.
+    private func setExpanded(_ value: Bool) {
+        guard isExpanded != value else { return }
+        isExpanded = value
+    }
+
+    private func teardownPanel() {
+        panel?.hide()
+        panel = nil
+        setExpanded(false)
+    }
+
+    private func observeScreenChanges() {
+        screenObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.applyVisibility() }
+        }
+    }
+
+    private func observeActiveSpace() {
+        spaceObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.activeSpaceDidChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.refreshFullscreenHiding() }
+        }
+    }
+
+    /// Re-evaluate when the user toggles the island from Settings or the menu.
+    private func observeSettingChanges() {
+        settingObserver = NotificationCenter.default.addObserver(
+            forName: .pulseIslandSettingChanged,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.applyVisibility() }
+        }
+    }
+
+    /// Hide the island when a fullscreen app covers the menu-bar screen;
+    /// show it again otherwise. No-op unless enabled + a notch exists.
+    private func refreshFullscreenHiding() {
+        let enabled = PulseSharedSettings.defaults.bool(forKey: PulseSharedSettings.Keys.islandEnabled)
+        guard enabled, notchPresent, panel != nil else { return }
+
+        if DynamicIslandPanel.frontmostAppCoversMenuBarScreen() {
+            panel?.hide()
+        } else {
+            panel?.show()
+        }
+    }
+}
+
 // MARK: - Menu Bar
 struct PulseMenuBarLabel: View {
     @ObservedObject var statsController: PulseStatsController
@@ -175,8 +305,9 @@ struct PulseMenuBarLabel: View {
         Label {
             Text("CPU \(PulseSettings.percent(stats.cpuUsage)) RAM \(PulseSettings.percent(stats.memoryUsage))")
         } icon: {
-            Image(systemName: "gauge.with.dots.needle.50percent")
+            Image(systemName: "waveform.path.ecg")
         }
+        .accessibilityLabel(Text("Pulse, CPU \(PulseSettings.percent(stats.cpuUsage)), RAM \(PulseSettings.percent(stats.memoryUsage))"))
     }
 }
 
@@ -187,6 +318,7 @@ struct PulseMenuBarMenu: View {
     @AppStorage(PulseSettings.Keys.showDisk, store: PulseSettings.defaults) private var showDisk = true
     @AppStorage(PulseSettings.Keys.showNetwork, store: PulseSettings.defaults) private var showNetwork = true
     @AppStorage(PulseSettings.Keys.showActiveApps, store: PulseSettings.defaults) private var showActiveApps = true
+    @AppStorage(PulseSettings.Keys.islandEnabled, store: PulseSettings.defaults) private var islandEnabled = false
 
     private var stats: SystemStats {
         statsController.stats
@@ -198,6 +330,7 @@ struct PulseMenuBarMenu: View {
 
     var body: some View {
         Text("CPU \(PulseSettings.percent(stats.cpuUsage))   RAM \(PulseSettings.percent(stats.memoryUsage))")
+            .font(.headline)
 
         if showBattery {
             Text(batterySummary)
@@ -216,6 +349,11 @@ struct PulseMenuBarMenu: View {
         }
 
         Divider()
+
+        Toggle("Dynamic Island", isOn: $islandEnabled)
+            .onChange(of: islandEnabled) { _, _ in
+                NotificationCenter.default.post(name: .pulseIslandSettingChanged, object: nil)
+            }
 
         Button {
             statsController.refresh(reloadWidgets: true)
@@ -274,80 +412,92 @@ struct PulseSettingsView: View {
     @AppStorage(PulseSettings.Keys.showDisk, store: PulseSettings.defaults) private var showDisk = true
     @AppStorage(PulseSettings.Keys.showNetwork, store: PulseSettings.defaults) private var showNetwork = true
     @AppStorage(PulseSettings.Keys.showActiveApps, store: PulseSettings.defaults) private var showActiveApps = true
+    @AppStorage(PulseSettings.Keys.islandEnabled, store: PulseSettings.defaults) private var islandEnabled = false
 
     @State private var launchAtLoginEnabled = LaunchAtLoginService.isOnOrPendingApproval
     @State private var launchAtLoginStatusText = LaunchAtLoginService.statusText
     @State private var launchAtLoginError: String?
 
-    private let metricColumns = [
-        GridItem(.flexible(), spacing: 12),
-        GridItem(.flexible(), spacing: 12)
-    ]
+    private var metricColumns: [GridItem] {
+        [
+            GridItem(.adaptive(minimum: 140), spacing: 12)
+        ]
+    }
 
     var body: some View {
         ZStack {
             VisualEffectBackground(material: .sidebar, blendingMode: .behindWindow)
                 .ignoresSafeArea()
 
-            VStack(alignment: .leading, spacing: 16) {
-                header
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    header
 
-                GroupBox {
-                    VStack(alignment: .leading, spacing: 12) {
-                        Toggle("Launch at Login", isOn: launchAtLoginBinding)
-                        settingsStatusRow(launchAtLoginError ?? launchAtLoginStatusText)
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                } label: {
-                    SettingsSectionLabel(title: "Startup", systemImage: "power")
-                }
-
-                GroupBox {
-                    VStack(alignment: .leading, spacing: 12) {
-                        HStack {
-                            Text("Refresh Interval")
-                            Spacer()
-                            Picker("Refresh Interval", selection: $refreshInterval) {
-                                ForEach(PulseSettings.refreshIntervals, id: \.self) { interval in
-                                    Text(PulseSettings.intervalLabel(interval)).tag(interval)
-                                }
-                            }
-                            .labelsHidden()
-                            .frame(width: 120)
+                    GroupBox {
+                        VStack(alignment: .leading, spacing: 12) {
+                            Toggle("Launch at Login", isOn: launchAtLoginBinding)
+                            settingsStatusRow(launchAtLoginError ?? launchAtLoginStatusText)
                         }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    } label: {
+                        SettingsSectionLabel(title: "Startup", systemImage: "power")
+                    }
 
-                        HStack {
-                            Text("Units")
-                            Spacer()
-                            Picker("Units", selection: $unitsModeRaw) {
-                                ForEach(PulseSettings.UnitsMode.allCases) { mode in
-                                    Text(mode.title).tag(mode.rawValue)
-                                }
-                            }
-                            .labelsHidden()
-                            .pickerStyle(.segmented)
-                            .frame(width: 180)
+                    GroupBox {
+                        VStack(alignment: .leading, spacing: 12) {
+                            Toggle("Dynamic Island", isOn: $islandEnabled)
+                            settingsStatusRow(islandStatusText)
                         }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    } label: {
+                        SettingsSectionLabel(title: "Dynamic Island", systemImage: "rectangle.dashed")
                     }
-                } label: {
-                    SettingsSectionLabel(title: "Display", systemImage: "slider.horizontal.3")
-                }
 
-                GroupBox {
-                    LazyVGrid(columns: metricColumns, alignment: .leading, spacing: 10) {
-                        Toggle("Battery", isOn: $showBattery)
-                        Toggle("Disk", isOn: $showDisk)
-                        Toggle("Network", isOn: $showNetwork)
-                        Toggle("Active Apps", isOn: $showActiveApps)
+                    GroupBox {
+                        VStack(alignment: .leading, spacing: 12) {
+                            settingsControlRow("Refresh Interval") {
+                                Picker("Refresh Interval", selection: $refreshInterval) {
+                                    ForEach(PulseSettings.refreshIntervals, id: \.self) { interval in
+                                        Text(PulseSettings.intervalLabel(interval)).tag(interval)
+                                    }
+                                }
+                                .labelsHidden()
+                                .frame(width: 120)
+                            }
+
+                            settingsControlRow("Units") {
+                                Picker("Units", selection: $unitsModeRaw) {
+                                    ForEach(PulseSettings.UnitsMode.allCases) { mode in
+                                        Text(mode.title).tag(mode.rawValue)
+                                    }
+                                }
+                                .labelsHidden()
+                                .pickerStyle(.segmented)
+                                .frame(width: 180)
+                            }
+                        }
+                    } label: {
+                        SettingsSectionLabel(title: "Display", systemImage: "slider.horizontal.3")
                     }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                } label: {
-                    SettingsSectionLabel(title: "Widget & Menu Metrics", systemImage: "menubar.rectangle")
+
+                    GroupBox {
+                        LazyVGrid(columns: metricColumns, alignment: .leading, spacing: 10) {
+                            Toggle("Battery", isOn: $showBattery)
+                            Toggle("Disk", isOn: $showDisk)
+                            Toggle("Network", isOn: $showNetwork)
+                            Toggle("Active Apps", isOn: $showActiveApps)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    } label: {
+                        SettingsSectionLabel(title: "Widget & Menu Metrics", systemImage: "menubar.rectangle")
+                    }
                 }
+                .padding(22)
+                .frame(maxWidth: 440, alignment: .topLeading)
             }
-            .padding(20)
         }
-        .frame(width: 420)
+        .scrollIndicators(.hidden)
+        .frame(minWidth: 320, idealWidth: 440, maxWidth: 440)
         .onAppear {
             syncLaunchAtLoginState()
             statsController.updateRefreshInterval(refreshInterval)
@@ -364,24 +514,55 @@ struct PulseSettingsView: View {
         .onChange(of: showDisk) { _, _ in reloadWidgetsForSettingsChange() }
         .onChange(of: showNetwork) { _, _ in reloadWidgetsForSettingsChange() }
         .onChange(of: showActiveApps) { _, _ in reloadWidgetsForSettingsChange() }
+        .onChange(of: islandEnabled) { _, _ in
+            // The island controller observes this notification and re-evaluates
+            // visibility against the (now-updated) setting + notch presence.
+            NotificationCenter.default.post(name: .pulseIslandSettingChanged, object: nil)
+        }
     }
 
     private var header: some View {
         HStack(spacing: 10) {
-            Image(systemName: "gauge.with.dots.needle.50percent")
-                .font(.system(size: 20, weight: .medium))
-                .foregroundColor(AppColors.ramBlue)
+            ZStack {
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .fill(AppColors.ramBlue.opacity(0.16))
+                    .frame(width: 34, height: 34)
+
+                Image(systemName: "waveform.path.ecg")
+                    .font(.system(size: 17, weight: .semibold))
+                    .foregroundStyle(AppColors.ramBlue)
+            }
 
             VStack(alignment: .leading, spacing: 2) {
                 Text("Pulse Settings")
                     .font(.system(size: 16, weight: .semibold))
+                    .lineLimit(1)
 
-                Text("Menu bar and startup")
+                Text("Mac widget and menu bar")
                     .font(.system(size: 12))
-                    .foregroundColor(.secondary)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
             }
 
             Spacer()
+        }
+    }
+
+    private func settingsControlRow<Control: View>(
+        _ title: String,
+        @ViewBuilder control: () -> Control
+    ) -> some View {
+        ViewThatFits(in: .horizontal) {
+            HStack {
+                Text(title)
+                Spacer(minLength: 12)
+                control()
+            }
+
+            VStack(alignment: .leading, spacing: 7) {
+                Text(title)
+                control()
+            }
         }
     }
 
@@ -396,7 +577,12 @@ struct PulseSettingsView: View {
     private func settingsStatusRow(_ text: String) -> some View {
         Text(text)
             .font(.system(size: 11))
-            .foregroundColor(launchAtLoginError == nil ? .secondary : .red)
+            .foregroundStyle(launchAtLoginError == nil ? .secondary : AppColors.critical)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private var islandStatusText: String {
+        DynamicIslandPanel.notchIsPresent ? "Notch detected" : "No notch on this Mac — island unavailable"
     }
 
     private func syncLaunchAtLoginState() {
@@ -433,7 +619,7 @@ struct SettingsSectionLabel: View {
     var body: some View {
         Label(title, systemImage: systemImage)
             .font(.system(size: 12, weight: .semibold))
-            .foregroundColor(.secondary)
+            .foregroundStyle(.secondary)
     }
 }
 
@@ -459,6 +645,7 @@ struct VisualEffectBackground: NSViewRepresentable {
 // MARK: - Main Content View
 struct ContentView: View {
     @EnvironmentObject private var statsController: PulseStatsController
+    @Environment(\.openWindow) private var openWindow
     @State private var selectedSize: WidgetSize = .medium
 
     enum WidgetSize: String, CaseIterable {
@@ -469,36 +656,27 @@ struct ContentView: View {
 
     var body: some View {
         ZStack {
-            // Native macOS vibrancy background
             VisualEffectBackground(material: .sidebar, blendingMode: .behindWindow)
                 .ignoresSafeArea()
 
-            VStack(spacing: 0) {
-                // Title bar area
-                titleBar
-                    .padding(.horizontal, 20)
-                    .padding(.top, 16)
-                    .padding(.bottom, 12)
+            ScrollView {
+                VStack(spacing: 16) {
+                    titleBar
+                        .padding(.top, 18)
 
-                Divider()
-                    .padding(.horizontal, 20)
+                    controlsRow
 
-                // Size picker
-                sizePicker
-                    .padding(.top, 16)
-                    .padding(.bottom, 20)
+                    widgetPreview
 
-                // Widget preview
-                widgetPreview
-                    .padding(.horizontal, 20)
-
-                Spacer()
-
-                // Footer instructions
-                footer
-                    .padding(.bottom, 20)
+                    bottomBar
+                }
+                .padding(.horizontal, 20)
+                .padding(.bottom, 18)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
             }
         }
+        .scrollIndicators(.hidden)
+        .frame(minWidth: 320, minHeight: 360)
         .onAppear {
             statsController.refresh()
         }
@@ -506,33 +684,71 @@ struct ContentView: View {
 
     // MARK: - Title Bar
     private var titleBar: some View {
-        HStack {
+        HStack(spacing: 12) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(AppColors.ramBlue.opacity(0.16))
+                    .frame(width: 36, height: 36)
+
+                Image(systemName: "waveform.path.ecg")
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundStyle(AppColors.ramBlue)
+            }
+
             VStack(alignment: .leading, spacing: 2) {
                 Text("Pulse")
                     .font(.system(size: 16, weight: .semibold))
-                    .foregroundColor(.primary)
+                    .foregroundStyle(.primary)
 
                 Text("System Monitor")
                     .font(.system(size: 12))
-                    .foregroundColor(.secondary)
+                    .foregroundStyle(.secondary)
             }
 
             Spacer()
 
-            // Live indicator
-            HStack(spacing: 6) {
-                Circle()
-                    .fill(Color.green)
-                    .frame(width: 6, height: 6)
-
-                Text("Live")
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundColor(.secondary)
+            Button {
+                statsController.refresh(reloadWidgets: true)
+            } label: {
+                Label("Refresh Stats", systemImage: "arrow.clockwise")
+                    .labelStyle(.iconOnly)
+                    .font(.system(size: 13, weight: .semibold))
             }
+            .buttonStyle(.borderless)
+            .help("Refresh")
+            .accessibilityHint(Text("Refreshes the current system metrics and widget timeline."))
+
+            Button {
+                openWindow(id: PulseSettings.settingsWindowID)
+                NSApplication.shared.activate(ignoringOtherApps: true)
+            } label: {
+                Label("Open Settings", systemImage: "gearshape")
+                    .labelStyle(.iconOnly)
+                    .font(.system(size: 13, weight: .semibold))
+            }
+            .buttonStyle(.borderless)
+            .help("Settings")
+            .accessibilityHint(Text("Opens Pulse settings."))
         }
     }
 
     // MARK: - Size Picker
+    private var controlsRow: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack {
+                sizePicker
+                Spacer(minLength: 12)
+                statusStrip
+            }
+
+            VStack(alignment: .leading, spacing: 10) {
+                sizePicker
+                statusStrip
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
     private var sizePicker: some View {
         Picker("Widget Size", selection: $selectedSize) {
             ForEach(WidgetSize.allCases, id: \.self) { size in
@@ -540,49 +756,110 @@ struct ContentView: View {
             }
         }
         .pickerStyle(.segmented)
-        .frame(maxWidth: 240)
+        .labelsHidden()
+        .frame(width: 190)
+    }
+
+    private var statusStrip: some View {
+        HStack(spacing: 8) {
+            MetricPill(title: "CPU", value: PulseSettings.percent(statsController.stats.cpuUsage), color: AppColors.cpuGreen)
+            MetricPill(title: "RAM", value: PulseSettings.percent(statsController.stats.memoryUsage), color: AppColors.ramBlue)
+        }
     }
 
     // MARK: - Widget Preview
     private var widgetPreview: some View {
-        Group {
-            switch selectedSize {
-            case .small:
-                SmallWidgetView(stats: statsController.stats)
-                    .frame(width: 170, height: 170)
-            case .medium:
-                MediumWidgetView(stats: statsController.stats)
-                    .frame(width: 360, height: 170)
-            case .large:
-                LargeWidgetView(stats: statsController.stats)
-                    .frame(width: 360, height: 380)
-            }
+        ViewThatFits(in: .horizontal) {
+            scaledWidgetPreview(1)
+            scaledWidgetPreview(0.85)
+            scaledWidgetPreview(0.75)
         }
-        .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
-        .shadow(color: Color.black.opacity(0.15), radius: 12, x: 0, y: 4)
-        .overlay(
-            RoundedRectangle(cornerRadius: 20, style: .continuous)
-                .stroke(Color.primary.opacity(0.08), lineWidth: 0.5)
-        )
-        .animation(.spring(response: 0.35, dampingFraction: 0.8), value: selectedSize)
     }
 
-    // MARK: - Footer
-    private var footer: some View {
-        VStack(spacing: 8) {
-            HStack(spacing: 6) {
-                Image(systemName: "plus.square.on.square")
-                    .font(.system(size: 12))
-                    .foregroundColor(.secondary)
-
-                Text("Add to Notification Center")
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundColor(.secondary)
-            }
-
-            Text("Click date in menu bar \u{2192} Edit Widgets")
-                .font(.system(size: 11))
-                .foregroundColor(Color(NSColor.tertiaryLabelColor))
+    private var previewSize: CGSize {
+        switch selectedSize {
+        case .small:
+            return CGSize(width: 170, height: 170)
+        case .medium:
+            return CGSize(width: 360, height: 170)
+        case .large:
+            return CGSize(width: 360, height: 380)
         }
+    }
+
+    @ViewBuilder
+    private var selectedWidgetView: some View {
+        switch selectedSize {
+        case .small:
+            SmallWidgetView(stats: statsController.stats)
+        case .medium:
+            MediumWidgetView(stats: statsController.stats)
+        case .large:
+            LargeWidgetView(stats: statsController.stats)
+        }
+    }
+
+    private func scaledWidgetPreview(_ scale: CGFloat) -> some View {
+        let size = previewSize
+
+        return selectedWidgetView
+            .frame(width: size.width, height: size.height)
+            .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+            .shadow(color: Color.black.opacity(0.16), radius: 18, x: 0, y: 8)
+            .overlay(
+                RoundedRectangle(cornerRadius: 20, style: .continuous)
+                    .stroke(Color.primary.opacity(0.08), lineWidth: 0.5)
+            )
+            .scaleEffect(scale)
+            .frame(width: size.width * scale, height: size.height * scale)
+            .animation(.spring(response: 0.35, dampingFraction: 0.8), value: selectedSize)
+    }
+
+    private var bottomBar: some View {
+        HStack {
+            Label("Updated \(PulseSettings.intervalLabel(PulseSettings.storedRefreshInterval))", systemImage: "clock")
+                .font(.system(size: 11, weight: .regular, design: .rounded))
+                .foregroundStyle(.secondary)
+
+            Spacer()
+
+            if statsController.stats.isStale {
+                Label("Stale", systemImage: "clock.badge.exclamationmark")
+                    .font(.system(size: 11, weight: .regular, design: .rounded))
+                    .foregroundStyle(AppColors.diskAmber)
+            } else {
+                Label("Live", systemImage: "circle.fill")
+                    .font(.system(size: 11, weight: .regular, design: .rounded))
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+}
+
+struct MetricPill: View {
+    let title: String
+    let value: String
+    let color: Color
+
+    var body: some View {
+        HStack(spacing: 5) {
+            Circle()
+                .fill(color)
+                .frame(width: 5, height: 5)
+
+            Text(title)
+                .foregroundStyle(.secondary)
+
+            Text(value)
+                .foregroundStyle(.primary)
+                .monospacedDigit()
+        }
+        .font(.system(size: 11, weight: .regular, design: .rounded))
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(
+            Capsule(style: .continuous)
+                .fill(AppColors.capsuleFill)
+        )
     }
 }
