@@ -15,6 +15,8 @@
 		A1000006 /* WidgetViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000002; };
 		A1000007 /* SystemStats.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000003; };
 		A1000008 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A2000004; };
+		D1000010 /* DynamicIslandView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D2000010; };
+		D1000011 /* DynamicIslandPanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = D2000011; };
 		A1000011 /* WidgetKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000011; };
 		A1000012 /* SwiftUI.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000012; };
 		A1000013 /* IOKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000013; };
@@ -51,6 +53,8 @@
 		A2000003 /* SystemStats.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SystemStats.swift; sourceTree = "<group>"; };
 		A2000004 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		A2000005 /* MacMonitorApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MacMonitorApp.swift; sourceTree = "<group>"; };
+		D2000010 /* DynamicIslandView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DynamicIslandView.swift; sourceTree = "<group>"; };
+		D2000011 /* DynamicIslandPanel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DynamicIslandPanel.swift; sourceTree = "<group>"; };
 		A2000006 /* MacMonitorApp.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = MacMonitorApp.entitlements; sourceTree = "<group>"; };
 		A2000007 /* MacMonitorWidgetExtension.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = MacMonitorWidgetExtension.entitlements; sourceTree = "<group>"; };
 		A2000011 /* WidgetKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = WidgetKit.framework; path = System/Library/Frameworks/WidgetKit.framework; sourceTree = SDKROOT; };
@@ -91,6 +95,8 @@
 				A2000003 /* SystemStats.swift */,
 				A2000004 /* Assets.xcassets */,
 				A2000005 /* MacMonitorApp.swift */,
+				D2000010 /* DynamicIslandView.swift */,
+				D2000011 /* DynamicIslandPanel.swift */,
 				A2000006 /* MacMonitorApp.entitlements */,
 				A2000007 /* MacMonitorWidgetExtension.entitlements */,
 			);
@@ -229,6 +235,8 @@
 			buildActionMask = 2147483647;
 			files = (
 				A1000005 /* MacMonitorApp.swift in Sources */,
+				D1000010 /* DynamicIslandView.swift in Sources */,
+				D1000011 /* DynamicIslandPanel.swift in Sources */,
 				A1000006 /* WidgetViews.swift in Sources */,
 				A1000007 /* SystemStats.swift in Sources */,
 			);
