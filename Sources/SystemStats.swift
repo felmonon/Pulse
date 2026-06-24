@@ -3,6 +3,32 @@ import IOKit
 import IOKit.ps
 import AppKit
 
+// MARK: - Load Severity
+/// Coarse classification of how loaded a metric is, used to tint rings and
+/// give the widget a glanceable "is something under pressure?" signal.
+enum LoadSeverity: Int, Comparable {
+    case nominal = 0
+    case moderate = 1
+    case high = 2
+    case critical = 3
+
+    /// Maps a 0...1 utilization to a severity band.
+    /// Thresholds: <50% nominal, <75% moderate, <90% high, otherwise critical.
+    static func from(usage: Double) -> LoadSeverity {
+        let clamped = SystemStatsMath.unitInterval(usage)
+        switch clamped {
+        case ..<0.50: return .nominal
+        case ..<0.75: return .moderate
+        case ..<0.90: return .high
+        default: return .critical
+        }
+    }
+
+    static func < (lhs: LoadSeverity, rhs: LoadSeverity) -> Bool {
+        lhs.rawValue < rhs.rawValue
+    }
+}
+
 // MARK: - System Statistics Model
 struct SystemStats: Codable {
     var cpuUsage: Double
@@ -77,6 +103,7 @@ enum PulseSharedSettings {
         static let showDisk = "settings.showDisk"
         static let showNetwork = "settings.showNetwork"
         static let showActiveApps = "settings.showActiveApps"
+        static let islandEnabled = "settings.islandEnabled"
     }
 
     enum UnitsMode: String, CaseIterable, Identifiable {
@@ -101,7 +128,8 @@ enum PulseSharedSettings {
     }
 
     static func clampedRefreshInterval(_ value: TimeInterval) -> TimeInterval {
-        min(max(value, 1), 60)
+        guard value.isFinite else { return defaultRefreshInterval }
+        return min(max(value, 1), 60)
     }
 
     static func intervalLabel(_ interval: TimeInterval) -> String {
@@ -109,10 +137,26 @@ enum PulseSharedSettings {
     }
 
     static func percent(_ value: Double) -> String {
-        "\(Int((min(max(value, 0), 1) * 100).rounded()))%"
+        "\(Int((SystemStatsMath.unitInterval(value) * 100).rounded()))%"
+    }
+
+    /// Formats a gibibyte (GiB) value as a compact, human-readable string.
+    /// Used everywhere storage/memory appears so the unit is always GB and
+    /// the precision scales sensibly with magnitude (234 GB, not 234.5 GB).
+    static func formatGigabytes(_ value: Double) -> String {
+        guard value.isFinite else { return "0.00 GB" }
+        let clamped = max(value, 0)
+        if clamped >= 100 {
+            return String(format: "%.0f GB", clamped)
+        }
+        if clamped >= 10 {
+            return String(format: "%.1f GB", clamped)
+        }
+        return String(format: "%.2f GB", clamped)
     }
 
     static func formatSpeed(_ speed: Double, unitsMode: UnitsMode) -> String {
+        let speed = SystemStatsMath.sanitizeSpeed(speed)
         switch unitsMode {
         case .automatic:
             if speed >= 1024 {
@@ -201,6 +245,13 @@ enum SystemStatsMath {
         return clamp(Double(usedDelta) / Double(totalDelta))
     }
 
+    /// Clamps utilization-like values to 0...1 and treats non-finite samples as
+    /// empty so display code can safely convert them to percentages.
+    static func unitInterval(_ value: Double) -> Double {
+        guard value.isFinite else { return 0 }
+        return min(max(value, 0), 1)
+    }
+
     static func networkSpeed(
         previous: NetworkCounters?,
         current: NetworkCounters,
@@ -235,8 +286,31 @@ enum SystemStatsMath {
         )
     }
 
+    /// Exponential moving average for smoothing a noisy series (e.g. CPU %).
+    /// `previous` is nil on the first sample, in which case the current value
+    /// seeds the series. `alpha` in 0...1 is the weight given to the new
+    /// sample; smaller = smoother but more lag. Never returns NaN.
+    static func smoothed(previous: Double?, current: Double, alpha: Double) -> Double {
+        let a = min(max(alpha, 0), 1)
+        guard let previous, previous.isFinite else {
+            return current.isFinite ? current : 0
+        }
+        guard current.isFinite else {
+            return previous
+        }
+        return previous + (current - previous) * a
+    }
+
+    /// Normalizes a raw network speed (KB/s) so transient spikes from sampling
+    /// jitter, interface resets, or absurd values can't break the display.
+    static func sanitizeSpeed(_ speed: Double) -> Double {
+        let maxDisplayableSpeed: Double = 10_000_000
+        guard speed.isFinite, speed > 0 else { return 0 }
+        return min(speed, maxDisplayableSpeed)
+    }
+
     private static func clamp(_ value: Double) -> Double {
-        min(max(value, 0), 1)
+        unitInterval(value)
     }
 }
 
@@ -246,6 +320,15 @@ class SystemMonitor {
 
     private var previousCPUCounters: SystemStatsMath.CPUCounters?
     private var previousNetworkCounters: SystemStatsMath.NetworkCounters?
+
+    // EMA-smoothed display values. Raw CPU deltas between two samples are
+    // jumpy; smoothing with a light alpha keeps the ring from flickering
+    // every tick while still tracking real changes quickly.
+    private static let cpuSmoothingAlpha: Double = 0.4
+    private static let networkSmoothingAlpha: Double = 0.5
+    private var smoothedCPU: Double?
+    private var smoothedNetworkUp: Double?
+    private var smoothedNetworkDown: Double?
 
     func getCachedStats(maxAge: TimeInterval = 120) -> SystemStats? {
         SystemStatsCache.load(maxAge: maxAge)
@@ -264,8 +347,29 @@ class SystemMonitor {
         let battery = getBatteryLevel()
         let network = getNetworkSpeed()
 
+        let rawCPU = getCPUUsage()
+        let cpu = SystemStatsMath.smoothed(
+            previous: smoothedCPU,
+            current: rawCPU,
+            alpha: SystemMonitor.cpuSmoothingAlpha
+        )
+        smoothedCPU = cpu
+
+        let netUp = SystemStatsMath.smoothed(
+            previous: smoothedNetworkUp,
+            current: SystemStatsMath.sanitizeSpeed(network.up),
+            alpha: SystemMonitor.networkSmoothingAlpha
+        )
+        let netDown = SystemStatsMath.smoothed(
+            previous: smoothedNetworkDown,
+            current: SystemStatsMath.sanitizeSpeed(network.down),
+            alpha: SystemMonitor.networkSmoothingAlpha
+        )
+        smoothedNetworkUp = netUp
+        smoothedNetworkDown = netDown
+
         return SystemStats(
-            cpuUsage: getCPUUsage(),
+            cpuUsage: cpu,
             memoryUsage: memory.percentage,
             memoryUsed: memory.used,
             memoryTotal: memory.total,
@@ -277,8 +381,8 @@ class SystemMonitor {
             batteryLevel: battery.level,
             isCharging: battery.isCharging,
             hasBattery: battery.hasBattery,
-            networkUp: network.up,
-            networkDown: network.down,
+            networkUp: netUp,
+            networkDown: netDown,
             activeApps: getActiveApps(),
             timestamp: Date()
         )
@@ -483,5 +587,67 @@ class SystemMonitor {
         }
 
         return Array(apps)
+    }
+}
+
+// MARK: - Dynamic Island Math
+/// Pure, testable predicates for the Dynamic Island. Kept separate from any
+/// AppKit context so they compile in the test target (which links
+/// `SystemStats.swift` via the SPM library target).
+enum DynamicIslandMath {
+    /// The standard menu-bar height in points, with no notch. A safe-area top
+    /// inset greater than this implies the menu bar sits beside a notch.
+    static let menuBarOnlyHeight: CGFloat = 24
+
+    /// Pill dimensions. The resting pill exactly fills the notch vertically
+    /// and is comfortably narrower than the physical notch. The expanded pill
+    /// grows downward into a rounded card.
+    static let restingWidth: CGFloat = 150
+    static let expandedWidth: CGFloat = 240
+    static let expandedHeight: CGFloat = 150
+
+    /// Returns true when the screen has a physical notch.
+    ///
+    /// Notch presence is inferred two ways, matching Apple's guidance:
+    /// 1. `auxiliaryTopLeftArea` (the menu-bar area to the left of the notch)
+    ///    is non-nil only on notched screens.
+    /// 2. The safe-area top inset exceeds a plain menu bar (~24pt).
+    static func notchPresent(safeAreaTopInset: CGFloat, auxiliaryTopLeftArea: NSRect?) -> Bool {
+        guard auxiliaryTopLeftArea != nil else { return false }
+        guard safeAreaTopInset.isFinite else { return false }
+        return safeAreaTopInset > menuBarOnlyHeight
+    }
+
+    /// The resting pill frame: fills `notchHeight` vertically, centered on the
+    /// screen, pinned to the top edge. Uses AppKit screen coordinates
+    /// (origin bottom-left).
+    static func restingFrame(screen: CGRect, notchHeight: CGFloat) -> CGRect {
+        let height = max(notchHeight, 1)
+        let width = restingWidth
+        let x = screen.midX - width / 2
+        let y = screen.maxY - height  // top edge at screen top
+        return CGRect(x: x, y: y, width: width, height: height)
+    }
+
+    /// The expanded pill frame: same center and top edge as the resting frame,
+    /// taller and wider, so the expand animation reads as "growing downward".
+    static func expandedFrame(screen: CGRect, notchHeight: CGFloat) -> CGRect {
+        let width = expandedWidth
+        let height = expandedHeight
+        let x = screen.midX - width / 2
+        let y = screen.maxY - height  // top edge aligns with resting top edge
+        return CGRect(x: x, y: y, width: width, height: height)
+    }
+
+    /// Returns true when `window` fully covers `screen`, the heuristic for
+    /// "a fullscreen app is frontmost on this display". A small inset is
+    /// tolerated so a fullscreen window reported a few points short of the
+    /// screen edge still counts.
+    static func isFullscreen(window: CGRect, screen: CGRect) -> Bool {
+        let tolerance: CGFloat = 4
+        return window.minX <= screen.minX + tolerance
+            && window.minY <= screen.minY + tolerance
+            && window.maxX >= screen.maxX - tolerance
+            && window.maxY >= screen.maxY - tolerance
     }
 }
