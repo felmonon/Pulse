@@ -15,3 +15,6 @@ xcuserdata/
 *.xccheckout
 *.moved-aside
 *.xcuserstate
+
+# Brainstorming/visual companion scratch
+.superpowers/
