@@ -5,7 +5,7 @@ usage() {
   cat <<'USAGE'
 Package a signed Pulse macOS app for distribution.
 
-Defaults package build/DerivedData/Build/Products/Release/MacMonitorApp.app.
+Defaults package build/DerivedData/Build/Products/Release/Pulse.app.
 
 Environment variables:
   APP_PATH                         Signed .app to package.
@@ -43,7 +43,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONFIGURATION="${CONFIGURATION:-Release}"
 PRODUCT_NAME="${PRODUCT_NAME:-Pulse}"
 BUNDLE_NAME="${BUNDLE_NAME:-$PRODUCT_NAME.app}"
-APP_PATH="${APP_PATH:-$ROOT_DIR/build/DerivedData/Build/Products/$CONFIGURATION/MacMonitorApp.app}"
+APP_PATH="${APP_PATH:-$ROOT_DIR/build/DerivedData/Build/Products/$CONFIGURATION/Pulse.app}"
 RELEASE_DIR="${RELEASE_DIR:-$ROOT_DIR/build/release}"
 CREATE_ZIP="${CREATE_ZIP:-1}"
 CREATE_DMG="${CREATE_DMG:-1}"
@@ -97,7 +97,7 @@ certificate before packaging. Example:
   SIGNING_IDENTITY="Developer ID Application: Your Name (TEAMID1234)" \\
   INSTALL_PATH="\$PWD/build/release/Pulse.app" \\
   LAUNCH_AFTER_INSTALL=0 \\
-  ./scripts/build-install-release.sh
+  STAGING_INSTALL=1 SIGNING_MODE=manual ./scripts/build-install-release.sh
 EOF
     exit 1
   fi
@@ -119,7 +119,7 @@ notarization. Rebuild with an installed Developer ID Application certificate:
   SIGNING_IDENTITY="Developer ID Application: Your Name (TEAMID1234)" \\
   INSTALL_PATH="\$PWD/build/release/Pulse.app" \\
   LAUNCH_AFTER_INSTALL=0 \\
-  ./scripts/build-install-release.sh
+  STAGING_INSTALL=1 SIGNING_MODE=manual ./scripts/build-install-release.sh
 
 For a local development artifact only, rerun with REQUIRE_DEVELOPER_ID=0.
 EOF

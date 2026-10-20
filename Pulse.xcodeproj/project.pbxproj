@@ -61,7 +61,7 @@
 		A2000012 /* SwiftUI.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = SwiftUI.framework; path = System/Library/Frameworks/SwiftUI.framework; sourceTree = SDKROOT; };
 		A2000013 /* IOKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = IOKit.framework; path = System/Library/Frameworks/IOKit.framework; sourceTree = SDKROOT; };
 		A3000001 /* MacMonitorWidgetExtension.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = MacMonitorWidgetExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
-		A3000002 /* MacMonitorApp.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = MacMonitorApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		A3000002 /* Pulse.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Pulse.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -117,7 +117,7 @@
 			isa = PBXGroup;
 			children = (
 				A3000001 /* MacMonitorWidgetExtension.appex */,
-				A3000002 /* MacMonitorApp.app */,
+				A3000002 /* Pulse.app */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -157,8 +157,8 @@
 				A4000002 /* PBXTargetDependency */,
 			);
 			name = MacMonitorApp;
-			productName = MacMonitorApp;
-			productReference = A3000002;
+			productName = Pulse;
+			productReference = A3000002 /* Pulse.app */;
 			productType = "com.apple.product-type.application";
 		};
 /* End PBXNativeTarget section */
@@ -173,11 +173,21 @@
 				TargetAttributes = {
 					A8000001 = {
 						CreatedOnToolsVersion = 15.0;
-						DevelopmentTeam = WJX5PBY73S;
+						DevelopmentTeam = 549A496SHU;
+						SystemCapabilities = {
+							com.apple.ApplicationGroups = {
+								enabled = 1;
+							};
+						};
 					};
 					A8000002 = {
 						CreatedOnToolsVersion = 15.0;
-						DevelopmentTeam = WJX5PBY73S;
+						DevelopmentTeam = 549A496SHU;
+						SystemCapabilities = {
+							com.apple.ApplicationGroups = {
+								enabled = 1;
+							};
+						};
 					};
 				};
 			};
@@ -322,18 +332,18 @@
 				ASSETCATALOG_COMPILER_WIDGET_BACKGROUND_COLOR_NAME = WidgetBackground;
 				CODE_SIGN_ENTITLEMENTS = Sources/MacMonitorWidgetExtension.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 1;
+				CURRENT_PROJECT_VERSION = 2;
 				DEVELOPMENT_TEAM = 549A496SHU;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Sources/Info.plist;
-				INFOPLIST_KEY_CFBundleDisplayName = "Mac Monitor";
+				INFOPLIST_KEY_CFBundleDisplayName = Pulse;
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 					"@executable_path/../../../../Frameworks",
 				);
-				MARKETING_VERSION = 1.0;
+				MARKETING_VERSION = 1.0.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.macmonitor.widget.extension;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SKIP_INSTALL = YES;
@@ -349,19 +359,19 @@
 				ASSETCATALOG_COMPILER_WIDGET_BACKGROUND_COLOR_NAME = WidgetBackground;
 				CODE_SIGN_ENTITLEMENTS = Sources/MacMonitorWidgetExtension.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 1;
+				CURRENT_PROJECT_VERSION = 2;
 				DEVELOPMENT_TEAM = 549A496SHU;
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Sources/Info.plist;
-				INFOPLIST_KEY_CFBundleDisplayName = "Mac Monitor";
+				INFOPLIST_KEY_CFBundleDisplayName = Pulse;
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 					"@executable_path/../../../../Frameworks",
 				);
-				MARKETING_VERSION = 1.0;
+				MARKETING_VERSION = 1.0.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.macmonitor.widget.extension;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SKIP_INSTALL = YES;
@@ -377,9 +387,12 @@
 				CODE_SIGN_ENTITLEMENTS = Sources/MacMonitorApp.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 1;
+				CURRENT_PROJECT_VERSION = 2;
 				DEVELOPMENT_TEAM = 549A496SHU;
+				EXECUTABLE_NAME = Pulse;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = Pulse;
+				INFOPLIST_KEY_CFBundleName = Pulse;
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				INFOPLIST_KEY_NSMainStoryboardFile = "";
 				INFOPLIST_KEY_NSPrincipalClass = NSApplication;
@@ -387,9 +400,9 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 1.0;
+				MARKETING_VERSION = 1.0.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.macmonitor.widget;
-				PRODUCT_NAME = "$(TARGET_NAME)";
+				PRODUCT_NAME = Pulse;
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_VERSION = 5.0;
 			};
@@ -402,10 +415,13 @@
 				CODE_SIGN_ENTITLEMENTS = Sources/MacMonitorApp.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 1;
+				CURRENT_PROJECT_VERSION = 2;
 				DEVELOPMENT_TEAM = 549A496SHU;
 				ENABLE_HARDENED_RUNTIME = YES;
+				EXECUTABLE_NAME = Pulse;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = Pulse;
+				INFOPLIST_KEY_CFBundleName = Pulse;
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				INFOPLIST_KEY_NSMainStoryboardFile = "";
 				INFOPLIST_KEY_NSPrincipalClass = NSApplication;
@@ -413,9 +429,9 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 1.0;
+				MARKETING_VERSION = 1.0.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.macmonitor.widget;
-				PRODUCT_NAME = "$(TARGET_NAME)";
+				PRODUCT_NAME = Pulse;
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_VERSION = 5.0;
 			};

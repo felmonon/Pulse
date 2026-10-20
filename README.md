@@ -53,7 +53,7 @@ Then press `⌘R` to build and run.
 ./scripts/build-install-release.sh
 ```
 
-The script builds the release app, signs the app and widget extension with the shared app-group entitlement, installs it to `/Applications/Pulse.app`, verifies the signature, and relaunches Pulse. It defaults to the project team; override `SIGNING_IDENTITY`, `DEVELOPMENT_TEAM`, `INSTALL_PATH`, or `LAUNCH_AFTER_INSTALL` if needed.
+The script builds the release app, signs the app and widget extension with the shared app-group entitlement, installs it to `/Applications/Pulse.app`, verifies the signature, and relaunches Pulse. It defaults to the project team; override `SIGNING_IDENTITY`, `DEVELOPMENT_TEAM`, `INSTALL_PATH`, or `LAUNCH_AFTER_INSTALL` if needed. Set `STAGING_INSTALL=1` for a package-staging path so the active app and widget remain untouched.
 
 For Developer ID signing, set a Developer ID Application identity. Hardened runtime and timestamping are enabled automatically for identities that start with `Developer ID Application:`.
 
@@ -62,7 +62,7 @@ DEVELOPMENT_TEAM="TEAMID1234" \
 SIGNING_IDENTITY="Developer ID Application: Your Name (TEAMID1234)" \
 INSTALL_PATH="$PWD/build/release/Pulse.app" \
 LAUNCH_AFTER_INSTALL=0 \
-./scripts/build-install-release.sh
+STAGING_INSTALL=1 SIGNING_MODE=manual ./scripts/build-install-release.sh
 ```
 
 ## Release Packaging

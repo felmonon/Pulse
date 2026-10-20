@@ -10,7 +10,7 @@ struct MacMonitorEntry: TimelineEntry {
 // MARK: - Timeline Provider
 struct MacMonitorProvider: TimelineProvider {
     private func currentStats() -> SystemStats {
-        SystemMonitor.shared.getCachedStats(maxAge: 120) ?? SystemMonitor.shared.getStats()
+        SystemMonitor.shared.getStats()
     }
 
     func placeholder(in context: Context) -> MacMonitorEntry {
@@ -64,6 +64,7 @@ struct MacMonitorWidget: Widget {
             MacMonitorWidgetEntryView(entry: entry)
                 .containerBackground(.fill.tertiary, for: .widget)
         }
+        .contentMarginsDisabled()
         .configurationDisplayName("Pulse")
         .description("Real-time CPU, memory, storage, battery & network monitoring.")
         .supportedFamilies([.systemSmall, .systemMedium, .systemLarge])

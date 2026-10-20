@@ -25,13 +25,13 @@ final class DynamicIslandMathTests: XCTestCase {
 
     // MARK: - Island frames
 
-    func testRestingFrameFillsNotchHeightAndCentersHorizontally() {
+    func testRestingFrameReservesVisibleShelfBelowNotch() {
         // Screen 1728pt wide (a 14" MacBook at default scaling), notch 32pt tall.
         let screen = CGRect(x: 0, y: 0, width: 1728, height: 1117)
-        let frame = DynamicIslandMath.restingFrame(screen: screen, notchHeight: 32)
+        let frame = DynamicIslandMath.restingFrame(screen: screen, notchHeight: 32, notchWidth: 200)
 
-        XCTAssertEqual(frame.height, 32, accuracy: 0.01)
-        XCTAssertEqual(frame.width, 150, accuracy: 0.01)
+        XCTAssertEqual(frame.height, 32 + DynamicIslandMath.restingShelfHeight, accuracy: 0.01)
+        XCTAssertGreaterThan(frame.width, 200)
         // Horizontally centered: midX == screen midX
         XCTAssertEqual(frame.midX, screen.midX, accuracy: 0.01)
         // Top edge at the top of the screen (y in screen coords; AppKit origin
@@ -41,8 +41,8 @@ final class DynamicIslandMathTests: XCTestCase {
 
     func testExpandedFrameGrowsDownwardFromSameTopEdge() {
         let screen = CGRect(x: 0, y: 0, width: 1728, height: 1117)
-        let resting = DynamicIslandMath.restingFrame(screen: screen, notchHeight: 32)
-        let expanded = DynamicIslandMath.expandedFrame(screen: screen, notchHeight: 32)
+        let resting = DynamicIslandMath.restingFrame(screen: screen, notchHeight: 32, notchWidth: 200)
+        let expanded = DynamicIslandMath.expandedFrame(screen: screen, notchHeight: 32, notchWidth: 200)
 
         // Same horizontal center
         XCTAssertEqual(expanded.midX, resting.midX, accuracy: 0.01)
@@ -52,11 +52,23 @@ final class DynamicIslandMathTests: XCTestCase {
         XCTAssertGreaterThan(expanded.width, resting.width)
     }
 
-    func testRestingWidthIsNarrowerThanTypicalNotch() {
-        // A 14" notch is ~200pt; the pill must be narrower so it sits inside.
-        let screen = CGRect(x: 0, y: 0, width: 1728, height: 1117)
-        let frame = DynamicIslandMath.restingFrame(screen: screen, notchHeight: 32)
-        XCTAssertLessThan(frame.width, 200)
+    func testFramesCenterOnAnOffsetDisplay() {
+        let screen = CGRect(x: -1728, y: 120, width: 1728, height: 1117)
+        let resting = DynamicIslandMath.restingFrame(screen: screen, notchHeight: 32, notchWidth: 190)
+        let expanded = DynamicIslandMath.expandedFrame(screen: screen, notchHeight: 32, notchWidth: 190)
+
+        XCTAssertEqual(resting.midX, screen.midX, accuracy: 0.01)
+        XCTAssertEqual(expanded.midX, screen.midX, accuracy: 0.01)
+        XCTAssertEqual(resting.maxY, screen.maxY, accuracy: 0.01)
+        XCTAssertEqual(expanded.maxY, screen.maxY, accuracy: 0.01)
+    }
+
+    func testInvalidNotchWidthUsesFallback() {
+        XCTAssertEqual(
+            DynamicIslandMath.restingWidth(notchWidth: .nan),
+            DynamicIslandMath.restingWidth(notchWidth: DynamicIslandMath.fallbackNotchWidth),
+            accuracy: 0.01
+        )
     }
 
     // MARK: - Fullscreen detection

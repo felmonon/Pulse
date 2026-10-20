@@ -2,8 +2,15 @@ import Foundation
 import IOKit
 import IOKit.ps
 import AppKit
+import Darwin
 
 // MARK: - Load Severity
+enum MemoryPressureLevel: Int, Codable {
+    case normal = 1
+    case warning = 2
+    case critical = 4
+}
+
 /// Coarse classification of how loaded a metric is, used to tint rings and
 /// give the widget a glanceable "is something under pressure?" signal.
 enum LoadSeverity: Int, Comparable {
@@ -15,11 +22,44 @@ enum LoadSeverity: Int, Comparable {
     /// Maps a 0...1 utilization to a severity band.
     /// Thresholds: <50% nominal, <75% moderate, <90% high, otherwise critical.
     static func from(usage: Double) -> LoadSeverity {
+        cpu(usage: usage)
+    }
+
+    static func cpu(usage: Double) -> LoadSeverity {
         let clamped = SystemStatsMath.unitInterval(usage)
         switch clamped {
         case ..<0.50: return .nominal
         case ..<0.75: return .moderate
         case ..<0.90: return .high
+        default: return .critical
+        }
+    }
+
+    /// RAM occupancy is not the same as memory pressure. Prefer the kernel's
+    /// pressure signal and use conservative occupancy bands only as a fallback.
+    static func memory(usage: Double, pressureLevel: MemoryPressureLevel?) -> LoadSeverity {
+        switch pressureLevel {
+        case .normal: return .nominal
+        case .warning: return .high
+        case .critical: return .critical
+        case nil:
+            let clamped = SystemStatsMath.unitInterval(usage)
+            switch clamped {
+            case ..<0.75: return .nominal
+            case ..<0.85: return .moderate
+            case ..<0.95: return .high
+            default: return .critical
+            }
+        }
+    }
+
+    /// Storage stays usable at much higher occupancy than CPU or RAM.
+    static func disk(usage: Double) -> LoadSeverity {
+        let clamped = SystemStatsMath.unitInterval(usage)
+        switch clamped {
+        case ..<0.80: return .nominal
+        case ..<0.90: return .moderate
+        case ..<0.95: return .high
         default: return .critical
         }
     }
@@ -35,6 +75,7 @@ struct SystemStats: Codable {
     var memoryUsage: Double
     var memoryUsed: Double // GB
     var memoryTotal: Double // GB
+    var memoryPressureLevel: MemoryPressureLevel? = nil
     var diskUsage: Double
     var diskUsed: Double // GB
     var diskTotal: Double // GB
@@ -52,12 +93,25 @@ struct SystemStats: Codable {
         Date().timeIntervalSince(timestamp) > 120
     }
 
+    var cpuSeverity: LoadSeverity {
+        .cpu(usage: cpuUsage)
+    }
+
+    var memorySeverity: LoadSeverity {
+        .memory(usage: memoryUsage, pressureLevel: memoryPressureLevel)
+    }
+
+    var diskSeverity: LoadSeverity {
+        .disk(usage: diskUsage)
+    }
+
     static var placeholder: SystemStats {
         SystemStats(
             cpuUsage: 0.45,
             memoryUsage: 0.62,
             memoryUsed: 10.2,
             memoryTotal: 16.0,
+            memoryPressureLevel: .normal,
             diskUsage: 0.58,
             diskUsed: 234.5,
             diskTotal: 512.0,
@@ -74,19 +128,62 @@ struct SystemStats: Codable {
     }
 }
 
-// MARK: - Shared Stats Cache
+// MARK: - Shared Defaults
 enum PulseSharedDefaults {
     static let appGroupID = "group.com.macmonitor.widget.shared"
     static let legacySuiteName = "com.macmonitor.widget.shared"
+    private static let settingKeys = [
+        "settings.launchAtLogin",
+        "settings.refreshInterval",
+        "settings.unitsMode",
+        "settings.showBattery",
+        "settings.showDisk",
+        "settings.showNetwork",
+        "settings.showActiveApps",
+        "settings.islandEnabled"
+    ]
 
     static let defaults: UserDefaults = {
-        if FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroupID) != nil,
-           let groupDefaults = UserDefaults(suiteName: appGroupID) {
-            return groupDefaults
+        if let containerURL = FileManager.default.containerURL(
+            forSecurityApplicationGroupIdentifier: appGroupID
+        ), let groupDefaults = UserDefaults(suiteName: appGroupID) {
+            let bundleID = Bundle.main.bundleIdentifier ?? "unknown"
+            let probeURL = containerURL.appendingPathComponent(".pulse-access-\(bundleID)")
+
+            do {
+                try Data().write(to: probeURL, options: .atomic)
+                try? FileManager.default.removeItem(at: probeURL)
+                copyMissingSettings(from: .standard, to: groupDefaults)
+                copyMissingSettings(
+                    from: UserDefaults(suiteName: legacySuiteName),
+                    to: groupDefaults
+                )
+                return groupDefaults
+            } catch {
+                // The installed profile may not authorize App Groups yet.
+            }
         }
 
-        return UserDefaults(suiteName: legacySuiteName) ?? .standard
+        let localDefaults = UserDefaults.standard
+        copyMissingSettings(
+            from: UserDefaults(suiteName: legacySuiteName),
+            to: localDefaults
+        )
+        return localDefaults
     }()
+
+    private static func copyMissingSettings(
+        from source: UserDefaults?,
+        to destination: UserDefaults
+    ) {
+        guard let source else { return }
+
+        for key in settingKeys where destination.object(forKey: key) == nil {
+            if let value = source.object(forKey: key) {
+                destination.set(value, forKey: key)
+            }
+        }
+    }
 }
 
 // MARK: - Shared Display Settings
@@ -179,35 +276,6 @@ enum PulseSharedSettings {
     }
 }
 
-// MARK: - Shared Stats Cache
-enum SystemStatsCache {
-    private static let statsKey = "latestSystemStats"
-    private static let defaults = PulseSharedDefaults.defaults
-
-    static func save(_ stats: SystemStats) {
-        guard let data = try? JSONEncoder().encode(stats) else {
-            return
-        }
-
-        defaults.set(data, forKey: statsKey)
-        defaults.synchronize()
-    }
-
-    static func load(maxAge: TimeInterval) -> SystemStats? {
-        guard let data = defaults.data(forKey: statsKey),
-              let stats = try? JSONDecoder().decode(SystemStats.self, from: data) else {
-            return nil
-        }
-
-        let age = Date().timeIntervalSince(stats.timestamp)
-        guard age >= 0 && age <= maxAge else {
-            return nil
-        }
-
-        return stats
-    }
-}
-
 // MARK: - Testable Math
 enum SystemStatsMath {
     struct CPUCounters: Equatable {
@@ -223,6 +291,14 @@ enum SystemStatsMath {
     struct NetworkCounters: Equatable {
         let interfaces: [String: NetworkInterfaceCounters]
         let date: Date
+    }
+
+    struct DiskUsage: Equatable {
+        let percentage: Double
+        let usedBytes: Double
+        let totalBytes: Double
+        let availableBytes: Double
+        let purgeableBytes: Double
     }
 
     static func cpuUsage(previous: CPUCounters?, current: CPUCounters) -> Double {
@@ -250,6 +326,42 @@ enum SystemStatsMath {
     static func unitInterval(_ value: Double) -> Double {
         guard value.isFinite else { return 0 }
         return min(max(value, 0), 1)
+    }
+
+    /// APFS can reclaim purgeable space on demand. Treat that capacity as
+    /// available so Pulse agrees with macOS Storage instead of reporting only
+    /// the container's immediately unallocated bytes.
+    static func diskUsage(
+        totalBytes: Double,
+        freeBytes: Double,
+        importantAvailableBytes: Double
+    ) -> DiskUsage {
+        guard totalBytes.isFinite, totalBytes > 0 else {
+            return DiskUsage(
+                percentage: 0,
+                usedBytes: 0,
+                totalBytes: 0,
+                availableBytes: 0,
+                purgeableBytes: 0
+            )
+        }
+
+        let hardFree = freeBytes.isFinite
+            ? min(max(freeBytes, 0), totalBytes)
+            : 0
+        let importantAvailable = importantAvailableBytes.isFinite
+            ? min(max(importantAvailableBytes, 0), totalBytes)
+            : hardFree
+        let available = max(hardFree, importantAvailable)
+        let used = totalBytes - available
+
+        return DiskUsage(
+            percentage: unitInterval(used / totalBytes),
+            usedBytes: used,
+            totalBytes: totalBytes,
+            availableBytes: available,
+            purgeableBytes: available - hardFree
+        )
     }
 
     static func networkSpeed(
@@ -318,6 +430,7 @@ enum SystemStatsMath {
 class SystemMonitor {
     static let shared = SystemMonitor()
 
+    private let samplingLock = NSLock()
     private var previousCPUCounters: SystemStatsMath.CPUCounters?
     private var previousNetworkCounters: SystemStatsMath.NetworkCounters?
 
@@ -330,18 +443,11 @@ class SystemMonitor {
     private var smoothedNetworkUp: Double?
     private var smoothedNetworkDown: Double?
 
-    func getCachedStats(maxAge: TimeInterval = 120) -> SystemStats? {
-        SystemStatsCache.load(maxAge: maxAge)
-    }
-
-    func getStatsAndCache() -> SystemStats {
-        let stats = getStats()
-        SystemStatsCache.save(stats)
-        return stats
-    }
-
     func getStats() -> SystemStats {
-        // Cache results to avoid multiple calls
+        samplingLock.lock()
+        defer { samplingLock.unlock() }
+
+        // Keep every field in this snapshot on the same serialized sample.
         let memory = getMemoryUsage()
         let disk = getDiskUsage()
         let battery = getBatteryLevel()
@@ -373,6 +479,7 @@ class SystemMonitor {
             memoryUsage: memory.percentage,
             memoryUsed: memory.used,
             memoryTotal: memory.total,
+            memoryPressureLevel: memory.pressureLevel,
             diskUsage: disk.percentage,
             diskUsed: disk.used,
             diskTotal: disk.total,
@@ -442,7 +549,12 @@ class SystemMonitor {
     }
 
     // MARK: - Memory Usage
-    private func getMemoryUsage() -> (percentage: Double, used: Double, total: Double) {
+    private func getMemoryUsage() -> (
+        percentage: Double,
+        used: Double,
+        total: Double,
+        pressureLevel: MemoryPressureLevel?
+    ) {
         var stats = vm_statistics64()
         var count = mach_msg_type_number_t(MemoryLayout<vm_statistics64>.size / MemoryLayout<integer_t>.size)
 
@@ -453,7 +565,7 @@ class SystemMonitor {
         }
 
         guard result == KERN_SUCCESS else {
-            return (0, 0, 0)
+            return (0, 0, 0, getMemoryPressureLevel())
         }
 
         let pageSize = Double(vm_kernel_page_size)
@@ -464,9 +576,31 @@ class SystemMonitor {
         let compressedMemory = Double(stats.compressor_page_count) * pageSize
 
         let usedMemory = activeMemory + wiredMemory + compressedMemory
-        let percentage = usedMemory / totalMemory
+        let percentage = totalMemory > 0 ? usedMemory / totalMemory : 0
 
-        return (min(percentage, 1.0), usedMemory / 1_073_741_824, totalMemory / 1_073_741_824)
+        return (
+            SystemStatsMath.unitInterval(percentage),
+            usedMemory / 1_073_741_824,
+            totalMemory / 1_073_741_824,
+            getMemoryPressureLevel()
+        )
+    }
+
+    private func getMemoryPressureLevel() -> MemoryPressureLevel? {
+        var rawLevel: Int32 = 0
+        var size = MemoryLayout<Int32>.size
+
+        guard sysctlbyname(
+            "kern.memorystatus_vm_pressure_level",
+            &rawLevel,
+            &size,
+            nil,
+            0
+        ) == 0 else {
+            return nil
+        }
+
+        return MemoryPressureLevel(rawValue: Int(rawLevel))
     }
 
     // MARK: - Disk Usage
@@ -482,12 +616,19 @@ class SystemMonitor {
             if let total = values.volumeTotalCapacity {
                 let freeBytes = Double(values.volumeAvailableCapacity ?? 0)
                 let importantAvailableBytes = values.volumeAvailableCapacityForImportantUsage.map(Double.init) ?? freeBytes
-                let totalGB = Double(total) / 1_000_000_000
-                let freeGB = freeBytes / 1_000_000_000
-                let usedGB = max(totalGB - freeGB, 0)
-                let purgeableGB = max((importantAvailableBytes - freeBytes) / 1_000_000_000, 0)
-                let percentage = totalGB > 0 ? usedGB / totalGB : 0
-                return (min(max(percentage, 0), 1), usedGB, totalGB, freeGB, purgeableGB)
+                let usage = SystemStatsMath.diskUsage(
+                    totalBytes: Double(total),
+                    freeBytes: freeBytes,
+                    importantAvailableBytes: importantAvailableBytes
+                )
+                let bytesPerGigabyte = 1_000_000_000.0
+                return (
+                    usage.percentage,
+                    usage.usedBytes / bytesPerGigabyte,
+                    usage.totalBytes / bytesPerGigabyte,
+                    usage.availableBytes / bytesPerGigabyte,
+                    usage.purgeableBytes / bytesPerGigabyte
+                )
             }
         } catch {}
 
@@ -599,12 +740,14 @@ enum DynamicIslandMath {
     /// inset greater than this implies the menu bar sits beside a notch.
     static let menuBarOnlyHeight: CGFloat = 24
 
-    /// Pill dimensions. The resting pill exactly fills the notch vertically
-    /// and is comfortably narrower than the physical notch. The expanded pill
-    /// grows downward into a rounded card.
-    static let restingWidth: CGFloat = 150
-    static let expandedWidth: CGFloat = 240
-    static let expandedHeight: CGFloat = 150
+    /// The panel reserves the physical cutout, then places all readable content
+    /// in a shelf below it. Widths expand from the measured cutout when AppKit
+    /// exposes both auxiliary menu-bar areas.
+    static let fallbackNotchWidth: CGFloat = 180
+    static let restingShelfHeight: CGFloat = 26
+    static let expandedContentHeight: CGFloat = 196
+    static let restingHorizontalPadding: CGFloat = 28
+    static let expandedHorizontalPadding: CGFloat = 96
 
     /// Returns true when the screen has a physical notch.
     ///
@@ -618,12 +761,26 @@ enum DynamicIslandMath {
         return safeAreaTopInset > menuBarOnlyHeight
     }
 
-    /// The resting pill frame: fills `notchHeight` vertically, centered on the
-    /// screen, pinned to the top edge. Uses AppKit screen coordinates
-    /// (origin bottom-left).
-    static func restingFrame(screen: CGRect, notchHeight: CGFloat) -> CGRect {
-        let height = max(notchHeight, 1)
-        let width = restingWidth
+    static func restingWidth(notchWidth: CGFloat) -> CGFloat {
+        let measuredWidth = notchWidth.isFinite && notchWidth > 0 ? notchWidth : fallbackNotchWidth
+        return max(measuredWidth + restingHorizontalPadding, 208)
+    }
+
+    static func expandedWidth(notchWidth: CGFloat) -> CGFloat {
+        let measuredWidth = notchWidth.isFinite && notchWidth > 0 ? notchWidth : fallbackNotchWidth
+        return max(measuredWidth + expandedHorizontalPadding, 300)
+    }
+
+    /// The resting panel keeps the cutout area empty and adds a compact shelf
+    /// below it. The top edge remains pinned to the top of the screen.
+    static func restingFrame(
+        screen: CGRect,
+        notchHeight: CGFloat,
+        notchWidth: CGFloat = fallbackNotchWidth
+    ) -> CGRect {
+        let cutoutHeight = notchHeight.isFinite ? max(notchHeight, 1) : 1
+        let height = cutoutHeight + restingShelfHeight
+        let width = restingWidth(notchWidth: notchWidth)
         let x = screen.midX - width / 2
         let y = screen.maxY - height  // top edge at screen top
         return CGRect(x: x, y: y, width: width, height: height)
@@ -631,9 +788,14 @@ enum DynamicIslandMath {
 
     /// The expanded pill frame: same center and top edge as the resting frame,
     /// taller and wider, so the expand animation reads as "growing downward".
-    static func expandedFrame(screen: CGRect, notchHeight: CGFloat) -> CGRect {
-        let width = expandedWidth
-        let height = expandedHeight
+    static func expandedFrame(
+        screen: CGRect,
+        notchHeight: CGFloat,
+        notchWidth: CGFloat = fallbackNotchWidth
+    ) -> CGRect {
+        let cutoutHeight = notchHeight.isFinite ? max(notchHeight, 1) : 1
+        let width = expandedWidth(notchWidth: notchWidth)
+        let height = cutoutHeight + expandedContentHeight
         let x = screen.midX - width / 2
         let y = screen.maxY - height  // top edge aligns with resting top edge
         return CGRect(x: x, y: y, width: width, height: height)
@@ -650,4 +812,5 @@ enum DynamicIslandMath {
             && window.maxX >= screen.maxX - tolerance
             && window.maxY >= screen.maxY - tolerance
     }
+
 }

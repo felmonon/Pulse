@@ -12,6 +12,7 @@ import AppKit
 /// It does NOT know about stats — it receives a root view from its owner.
 final class DynamicIslandPanel: NSPanel {
     private var globalClickMonitor: Any?
+    private var localClickMonitor: Any?
 
     /// Collapse callback invoked when a click lands outside the panel frame.
     var onCollapse: (() -> Void)?
@@ -19,7 +20,11 @@ final class DynamicIslandPanel: NSPanel {
     init(rootView: some View) {
         // .nonactivatingPanel: clicking the island never steals app focus.
         super.init(
-            contentRect: DynamicIslandMath.restingFrame(screen: NSScreen.main?.frame ?? .zero, notchHeight: DynamicIslandPanel.notchHeight),
+            contentRect: DynamicIslandMath.restingFrame(
+                screen: NSScreen.main?.frame ?? .zero,
+                notchHeight: DynamicIslandPanel.notchHeight,
+                notchWidth: DynamicIslandPanel.notchWidth
+            ),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
@@ -35,7 +40,10 @@ final class DynamicIslandPanel: NSPanel {
         self.hidesOnDeactivate = false
 
         let hosting = NSHostingView(rootView: rootView)
-        hosting.translatesAutoresizingMaskIntoConstraints = false
+        // Let the hosting view fill the window frame (which we size explicitly
+        // on expand/collapse) rather than letting it drive the window size.
+        hosting.translatesAutoresizingMaskIntoConstraints = true
+        hosting.autoresizingMask = [.width, .height]
         self.contentView = hosting
     }
 
@@ -58,6 +66,21 @@ final class DynamicIslandPanel: NSPanel {
         menuBarScreen?.safeAreaInsets.top ?? 32
     }
 
+    /// Width of the physical cutout between the two auxiliary menu-bar areas.
+    static var notchWidth: CGFloat {
+        guard let screen = menuBarScreen,
+              let leftArea = screen.auxiliaryTopLeftArea,
+              let rightArea = screen.auxiliaryTopRightArea else {
+            return DynamicIslandMath.fallbackNotchWidth
+        }
+
+        let measuredWidth = rightArea.minX - leftArea.maxX
+        guard measuredWidth.isFinite, measuredWidth > 0 else {
+            return DynamicIslandMath.fallbackNotchWidth
+        }
+        return measuredWidth
+    }
+
     /// The screen that hosts the menu bar (first in `NSScreen.screens`).
     static var menuBarScreen: NSScreen? {
         NSScreen.screens.first
@@ -65,8 +88,8 @@ final class DynamicIslandPanel: NSPanel {
 
     // MARK: - Show / hide
 
-    func show() {
-        positionAtNotch()
+    func show(expanded: Bool = false) {
+        positionAtNotch(expanded: expanded)
         orderFront(nil)
         startClickMonitor()
     }
@@ -76,39 +99,74 @@ final class DynamicIslandPanel: NSPanel {
         stopClickMonitor()
     }
 
-    /// Re-anchor to the notch — call on screen-layout changes.
-    func positionAtNotch() {
+    /// Re-anchor to the notch at the size matching the current expand state.
+    func positionAtNotch(expanded: Bool = false) {
         guard let screen = DynamicIslandPanel.menuBarScreen else { return }
-        let frame = DynamicIslandMath.restingFrame(screen: screen.frame, notchHeight: DynamicIslandPanel.notchHeight)
-        setFrame(frame, display: true)
+        setFrame(targetFrame(expanded: expanded, screen: screen.frame), display: true)
+    }
+
+    private func targetFrame(expanded: Bool, screen: CGRect) -> CGRect {
+        expanded
+            ? DynamicIslandMath.expandedFrame(
+                screen: screen,
+                notchHeight: DynamicIslandPanel.notchHeight,
+                notchWidth: DynamicIslandPanel.notchWidth
+            )
+            : DynamicIslandMath.restingFrame(
+                screen: screen,
+                notchHeight: DynamicIslandPanel.notchHeight,
+                notchWidth: DynamicIslandPanel.notchWidth
+            )
+    }
+
+    /// Animate the window frame to the resting or expanded size, anchored to
+    /// the notch. Mirrors the SwiftUI content's spring so the pill appears to
+    /// grow downward.
+    func setExpanded(_ expanded: Bool) {
+        guard let screen = DynamicIslandPanel.menuBarScreen else { return }
+        let target = targetFrame(expanded: expanded, screen: screen.frame)
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.32
+            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            self.animator().setFrame(target, display: true)
+        }
     }
 
     // MARK: - Fullscreen detection
 
-    /// True when a normal-layer window fully covers the menu-bar screen —
-    /// i.e. a fullscreen app is frontmost on that display.
-    static func frontmostAppCoversMenuBarScreen() -> Bool {
-        guard let screen = menuBarScreen else { return false }
-        guard let windowInfo = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] else {
+    /// True when a normal-layer window owned by the frontmost application
+    /// covers the menu-bar screen. Filtering by owner avoids mistaking an
+    /// auto-hidden menu bar or a background app for fullscreen content.
+    static func frontmostAppIsFullscreen() -> Bool {
+        guard let screen = menuBarScreen,
+              let screenNumber = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber,
+              let frontmostPID = NSWorkspace.shared.frontmostApplication?.processIdentifier,
+              let windowInfo = CGWindowListCopyWindowInfo(
+                [.optionOnScreenOnly, .excludeDesktopElements],
+                kCGNullWindowID
+              ) as? [[String: Any]] else {
             return false
         }
 
-        for info in windowInfo {
-            // kCGWindowLayer == 0 means a normal app window (not menu/overlay).
-            guard let layer = info[kCGWindowLayer as String] as? Int, layer == 0 else { continue }
-            // Skip fully transparent windows.
-            guard let alpha = info[kCGWindowAlpha as String] as? Double, alpha > 0 else { continue }
-            guard let boundsDict = info[kCGWindowBounds as String] as? [String: Any],
-                  let x = boundsDict["X"] as? CGFloat,
-                  let y = boundsDict["Y"] as? CGFloat,
-                  let w = boundsDict["Width"] as? CGFloat,
-                  let h = boundsDict["Height"] as? CGFloat else { continue }
+        let displayBounds = CGDisplayBounds(CGDirectDisplayID(screenNumber.uint32Value))
 
-            let windowRect = CGRect(x: x, y: y, width: w, height: h)
-            if DynamicIslandMath.isFullscreen(window: windowRect, screen: screen.frame) {
+        for info in windowInfo {
+            guard let ownerPID = (info[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value,
+                  ownerPID == frontmostPID,
+                  let layer = (info[kCGWindowLayer as String] as? NSNumber)?.intValue,
+                  layer == 0,
+                  let alpha = (info[kCGWindowAlpha as String] as? NSNumber)?.doubleValue,
+                  alpha > 0,
+                  let bounds = info[kCGWindowBounds as String],
+                  let windowFrame = CGRect(dictionaryRepresentation: bounds as! CFDictionary) else {
+                continue
+            }
+
+            if DynamicIslandMath.isFullscreen(window: windowFrame, screen: displayBounds) {
                 return true
             }
         }
+
         return false
     }
 
@@ -120,12 +178,23 @@ final class DynamicIslandPanel: NSPanel {
             guard let self else { return }
             self.onCollapse?()
         }
+        localClickMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown]) { [weak self] event in
+            guard let self else { return event }
+            if event.window !== self {
+                self.onCollapse?()
+            }
+            return event
+        }
     }
 
     private func stopClickMonitor() {
         if let monitor = globalClickMonitor {
             NSEvent.removeMonitor(monitor)
             globalClickMonitor = nil
+        }
+        if let monitor = localClickMonitor {
+            NSEvent.removeMonitor(monitor)
+            localClickMonitor = nil
         }
     }
 

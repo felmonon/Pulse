@@ -1,22 +1,72 @@
 import SwiftUI
 import WidgetKit
 
-// MARK: - Apple HIG Colors (Muted, purposeful)
+// MARK: - Native Widget Colors
 struct AppColors {
-    // Activity ring colors - muted, not harsh
-    static let cpuGreen = Color(red: 0.35, green: 0.78, blue: 0.48)
-    static let ramBlue = Color(red: 0.35, green: 0.68, blue: 0.95)
-    static let diskAmber = Color(red: 0.95, green: 0.65, blue: 0.25)
-    static let batteryGreen = Color(red: 0.35, green: 0.78, blue: 0.48)
-    static let networkBlue = Color(red: 0.4, green: 0.6, blue: 0.95)
-    static let networkGreen = Color(red: 0.35, green: 0.75, blue: 0.45)
-    static let critical = Color(red: 0.95, green: 0.35, blue: 0.35)
-    static let muted = Color.white.opacity(0.55)
+    static let cpuGreen = Color(red: 0.20, green: 0.67, blue: 0.35)
+    static let ramBlue = Color(red: 0.18, green: 0.48, blue: 0.86)
+    static let diskAmber = Color(red: 0.91, green: 0.55, blue: 0.15)
+    static let batteryGreen = Color(red: 0.20, green: 0.67, blue: 0.35)
+    static let networkBlue = Color(red: 0.18, green: 0.48, blue: 0.86)
+    static let networkGreen = Color(red: 0.20, green: 0.67, blue: 0.35)
+    static let critical = Color(red: 0.86, green: 0.22, blue: 0.20)
+    static let ringTrack = Color.secondary.opacity(0.14)
+    static let divider = Color.secondary.opacity(0.13)
+    static let capsuleFill = Color.primary.opacity(0.055)
+    static let subtleFill = Color.secondary.opacity(0.08)
+}
+
+// MARK: - Severity-Aware Ring Color
+extension AppColors {
+    static func ringColor(metric: SystemMetric, severity: LoadSeverity) -> Color {
+        switch severity {
+        case .nominal, .moderate:
+            return metric.baseColor
+        case .high:
+            return diskAmber
+        case .critical:
+            return critical
+        }
+    }
+
+    static func severityColor(_ severity: LoadSeverity, fallback: Color) -> Color {
+        switch severity {
+        case .nominal, .moderate:
+            return fallback
+        case .high:
+            return diskAmber
+        case .critical:
+            return critical
+        }
+    }
+}
+
+// MARK: - System Metric
+enum SystemMetric: String, CaseIterable {
+    case cpu
+    case memory
+    case disk
+
+    var baseColor: Color {
+        switch self {
+        case .cpu: return AppColors.cpuGreen
+        case .memory: return AppColors.ramBlue
+        case .disk: return AppColors.diskAmber
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .cpu: return "cpu"
+        case .memory: return "memorychip"
+        case .disk: return "internaldrive"
+        }
+    }
 }
 
 // MARK: - Dynamic Color Based on Threshold (for battery/warnings)
 func thresholdColor(for progress: Double) -> Color {
-    let percentage = progress * 100
+    let percentage = SystemStatsMath.unitInterval(progress) * 100
     if percentage < 50 {
         return AppColors.cpuGreen
     } else if percentage < 80 {
@@ -26,64 +76,215 @@ func thresholdColor(for progress: Double) -> Color {
     }
 }
 
-// MARK: - Activity Ring (Apple Watch Style)
+// MARK: - Activity Ring
 struct CircularProgressView: View {
     let progress: Double
     let icon: String
     let label: String
     let size: CGFloat
     var ringColor: Color = AppColors.cpuGreen
+    var severity: LoadSeverity? = nil
 
     private var clampedProgress: Double {
-        min(max(progress, 0), 1)
+        SystemStatsMath.unitInterval(progress)
+    }
+
+    private var roundedPercentage: Int {
+        Int((clampedProgress * 100).rounded())
+    }
+
+    private var effectiveSeverity: LoadSeverity {
+        severity ?? LoadSeverity.from(usage: progress)
     }
 
     var body: some View {
-        VStack(spacing: 8) {
+        VStack(spacing: size > 56 ? 6 : 5) {
             ZStack {
-                // Track (subtle)
                 Circle()
-                    .stroke(Color.white.opacity(0.08), lineWidth: size * 0.08)
+                    .stroke(AppColors.ringTrack, lineWidth: size * 0.075)
 
-                // Subtle glow
-                Circle()
-                    .trim(from: 0, to: clampedProgress)
-                    .stroke(
-                        ringColor.opacity(0.25),
-                        style: StrokeStyle(lineWidth: size * 0.12, lineCap: .round)
-                    )
-                    .rotationEffect(.degrees(-90))
-                    .blur(radius: 3)
-
-                // Activity ring arc (thin, Apple Watch style)
                 Circle()
                     .trim(from: 0, to: clampedProgress)
                     .stroke(
                         ringColor,
-                        style: StrokeStyle(lineWidth: size * 0.08, lineCap: .round)
+                        style: StrokeStyle(lineWidth: size * 0.075, lineCap: .round)
                     )
                     .rotationEffect(.degrees(-90))
 
-                // Center content
                 VStack(spacing: 2) {
                     Image(systemName: icon)
-                        .font(.system(size: size * 0.18, weight: .medium))
-                        .foregroundColor(ringColor.opacity(0.9))
+                        .font(.system(size: size * 0.14, weight: .medium))
+                        .foregroundStyle(.secondary)
 
-                    Text("\(Int(clampedProgress * 100))%")
-                        .font(.system(size: size * 0.22, weight: .medium, design: .rounded))
-                        .foregroundColor(.white)
+                    Text("\(roundedPercentage)%")
+                        .font(.system(size: size * 0.25, weight: .semibold, design: .rounded))
+                        .foregroundStyle(.primary)
+                        .monospacedDigit()
                 }
             }
             .frame(width: size, height: size)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(Text("\(label) \(roundedPercentage) percent"))
+            .accessibilityValue(Text(effectiveSeverity.accessibilityDescription))
 
             Text(label)
-                .font(.system(size: 10, weight: .regular))
-                .foregroundColor(.white.opacity(0.6))
+                .font(.system(size: size > 56 ? 11 : 10, weight: .regular))
+                .foregroundStyle(.secondary)
                 .frame(width: size, alignment: .center)
                 .lineLimit(1)
         }
         .frame(width: size)
+    }
+}
+
+extension LoadSeverity {
+    var title: String {
+        switch self {
+        case .nominal: return "OK"
+        case .moderate: return "Normal"
+        case .high: return "High"
+        case .critical: return "Critical"
+        }
+    }
+
+    var accessibilityDescription: String {
+        switch self {
+        case .nominal: return "nominal"
+        case .moderate: return "moderate load"
+        case .high: return "high load"
+        case .critical: return "critically high"
+        }
+    }
+}
+
+// MARK: - System Pressure Summary
+struct PressureSummary {
+    let label: String
+    let progress: Double
+    let severity: LoadSeverity
+    let color: Color
+
+    var percentText: String {
+        PulseSharedSettings.percent(progress)
+    }
+
+    static func highest(for stats: SystemStats, includesDisk: Bool = true) -> PressureSummary {
+        var candidates: [PressureSummary] = [
+            .init(
+                label: "CPU",
+                progress: stats.cpuUsage,
+                severity: stats.cpuSeverity,
+                color: AppColors.cpuGreen
+            ),
+            .init(
+                label: "RAM",
+                progress: stats.memoryUsage,
+                severity: stats.memorySeverity,
+                color: AppColors.ramBlue
+            )
+        ]
+
+        if includesDisk {
+            candidates.append(
+                .init(
+                    label: "Disk",
+                    progress: stats.diskUsage,
+                    severity: stats.diskSeverity,
+                    color: AppColors.diskAmber
+                )
+            )
+        }
+
+        return candidates.max { lhs, rhs in
+            if lhs.severity == rhs.severity {
+                return lhs.progress < rhs.progress
+            }
+            return lhs.severity < rhs.severity
+        } ?? candidates[0]
+    }
+}
+
+struct PressureSummaryView: View {
+    let stats: SystemStats
+    var compact = false
+    var includesDisk = true
+
+    private var pressure: PressureSummary {
+        PressureSummary.highest(for: stats, includesDisk: includesDisk)
+    }
+
+    private var statusColor: Color {
+        switch pressure.severity {
+        case .nominal, .moderate:
+            return .secondary
+        case .high:
+            return AppColors.diskAmber
+        case .critical:
+            return AppColors.critical
+        }
+    }
+
+    var body: some View {
+        HStack(spacing: compact ? 4 : 5) {
+            if pressure.severity >= .high {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: compact ? 8 : 9, weight: .medium))
+                    .foregroundStyle(statusColor)
+            }
+
+            Text("\(pressure.label) \(pressure.percentText)")
+                .font(.system(size: compact ? 10 : 11, weight: .regular, design: .rounded))
+                .foregroundStyle(.secondary)
+                .monospacedDigit()
+
+            if !compact {
+                Text(pressure.severity.title)
+                    .font(.system(size: 10, weight: .regular, design: .rounded))
+                    .foregroundStyle(statusColor)
+            }
+        }
+        .padding(.horizontal, compact ? 7 : 8)
+        .padding(.vertical, compact ? 3 : 4)
+        .background(
+            Capsule(style: .continuous)
+                .fill(AppColors.capsuleFill)
+        )
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(Text("System pressure \(pressure.label) \(pressure.percentText), \(pressure.severity.accessibilityDescription)"))
+    }
+}
+
+// MARK: - Widget Header
+struct WidgetHeader: View {
+    let stats: SystemStats
+    var showBattery = true
+    var compact = false
+    var showFreshness = true
+
+    var body: some View {
+        HStack(spacing: compact ? 6 : 8) {
+            Label {
+                Text("Pulse")
+                    .font(.system(size: compact ? 11 : 13, weight: .semibold, design: .rounded))
+            } icon: {
+                Image(systemName: "waveform.path.ecg")
+                    .font(.system(size: compact ? 10 : 12, weight: .semibold))
+                    .foregroundStyle(AppColors.ramBlue)
+            }
+            .labelStyle(.titleAndIcon)
+            .foregroundStyle(.primary)
+
+            Spacer(minLength: 6)
+
+            if showFreshness {
+                FreshnessView(date: stats.timestamp)
+            }
+
+            if showBattery {
+                BatteryView(level: stats.batteryLevel, isCharging: stats.isCharging, hasBattery: stats.hasBattery)
+            }
+        }
+        .accessibilityElement(children: .combine)
     }
 }
 
@@ -94,7 +295,7 @@ struct BatteryView: View {
     let hasBattery: Bool
 
     var color: Color {
-        if !hasBattery { return AppColors.muted }
+        if !hasBattery { return .secondary }
         if level <= 20 { return AppColors.critical }
         if level < 50 { return AppColors.diskAmber }
         return AppColors.batteryGreen
@@ -116,12 +317,20 @@ struct BatteryView: View {
         HStack(spacing: 4) {
             Image(systemName: icon)
                 .font(.system(size: 12, weight: .medium))
-                .foregroundColor(color)
+                .foregroundStyle(color)
 
             Text(hasBattery ? "\(level)%" : "AC")
                 .font(.system(size: 11, weight: .medium, design: .rounded))
-                .foregroundColor(.white.opacity(0.9))
+                .foregroundStyle(.secondary)
         }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(Text(accessibilityText))
+    }
+
+    private var accessibilityText: String {
+        guard hasBattery else { return "On AC power" }
+        let state = isCharging ? "charging" : "on battery"
+        return "Battery \(level) percent, \(state)"
     }
 }
 
@@ -129,33 +338,57 @@ struct BatteryView: View {
 struct NetworkView: View {
     let up: Double
     let down: Double
+    var compact = false
     @AppStorage(PulseSharedSettings.Keys.unitsMode, store: PulseSharedSettings.defaults) private var unitsModeRaw = PulseSharedSettings.UnitsMode.automatic.rawValue
 
     private var unitsMode: PulseSharedSettings.UnitsMode {
         PulseSharedSettings.UnitsMode(rawValue: unitsModeRaw) ?? .automatic
     }
 
-    var body: some View {
-        HStack(spacing: 8) {
-            // Upload
-            HStack(spacing: 3) {
-                Image(systemName: "arrow.up")
-                    .font(.system(size: 8, weight: .semibold))
-                    .foregroundColor(AppColors.networkBlue)
-                Text(PulseSharedSettings.formatSpeed(up, unitsMode: unitsMode))
-                    .font(.system(size: 9, weight: .medium, design: .rounded))
-                    .foregroundColor(.white.opacity(0.9))
-            }
+    /// Below ~1 KB/s the link is effectively quiet; showing "0 KB/s" on both
+    /// legs reads as broken, so we collapse to a calm Idle state.
+    private var isIdle: Bool {
+        up < 1 && down < 1
+    }
 
-            // Download
-            HStack(spacing: 3) {
-                Image(systemName: "arrow.down")
-                    .font(.system(size: 8, weight: .semibold))
-                    .foregroundColor(AppColors.networkGreen)
-                Text(PulseSharedSettings.formatSpeed(down, unitsMode: unitsMode))
-                    .font(.system(size: 9, weight: .medium, design: .rounded))
-                    .foregroundColor(.white.opacity(0.9))
+    var body: some View {
+        if isIdle {
+            HStack(spacing: 5) {
+                Image(systemName: "wifi")
+                    .font(.system(size: compact ? 8 : 9, weight: .medium))
+                    .foregroundStyle(.secondary)
+                Text("Idle")
+                    .font(.system(size: compact ? 9 : 10, weight: .regular, design: .rounded))
+                    .foregroundStyle(.secondary)
             }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(Text("Network idle"))
+        } else {
+            HStack(spacing: compact ? 6 : 8) {
+                // Upload
+                HStack(spacing: 3) {
+                    Image(systemName: "arrow.up")
+                        .font(.system(size: compact ? 7 : 8, weight: .semibold))
+                        .foregroundStyle(AppColors.networkBlue)
+                    Text(PulseSharedSettings.formatSpeed(up, unitsMode: unitsMode))
+                        .font(.system(size: compact ? 9 : 10, weight: .regular, design: .rounded))
+                        .foregroundStyle(.primary)
+                        .monospacedDigit()
+                }
+
+                // Download
+                HStack(spacing: 3) {
+                    Image(systemName: "arrow.down")
+                        .font(.system(size: compact ? 7 : 8, weight: .semibold))
+                        .foregroundStyle(AppColors.networkGreen)
+                    Text(PulseSharedSettings.formatSpeed(down, unitsMode: unitsMode))
+                        .font(.system(size: compact ? 9 : 10, weight: .regular, design: .rounded))
+                        .foregroundStyle(.primary)
+                        .monospacedDigit()
+                }
+            }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(Text("Network. Upload \(PulseSharedSettings.formatSpeed(up, unitsMode: unitsMode)). Download \(PulseSharedSettings.formatSpeed(down, unitsMode: unitsMode))"))
         }
     }
 }
@@ -189,8 +422,100 @@ struct FreshnessView: View {
 
             Text(label)
                 .font(.system(size: 10, weight: .medium, design: .rounded))
+                .monospacedDigit()
         }
-        .foregroundColor(isStale ? AppColors.diskAmber : AppColors.muted)
+        .foregroundStyle(isStale ? AppColors.diskAmber : .secondary)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(Text(isStale ? "Stats are stale, last updated \(label) ago" : "Updated \(label)"))
+    }
+}
+
+// MARK: - Widget Divider
+/// Hairline divider used between widget sections. Subtle so it reads as
+/// structure, not as a heavy rule.
+struct WidgetDivider: View {
+    var axis: Axis.Set = .horizontal
+
+    var body: some View {
+        Rectangle()
+            .fill(AppColors.divider)
+            .frame(
+                width: axis == .vertical ? 1 : nil,
+                height: axis == .vertical ? nil : 1
+            )
+    }
+}
+
+// MARK: - Linear Metric Row
+/// Compact metric row using the same quiet structure as system widgets.
+struct LinearMetricRow: View {
+    enum Style {
+        case compact   // medium widget: 10pt labels, 4pt dot, tight
+        case standard  // large widget: 11pt labels, 6pt dot, more air
+    }
+
+    let label: String
+    let value: String
+    let color: Color
+    var progress: Double? = nil
+    var severity: LoadSeverity? = nil
+    var style: Style = .standard
+
+    private var clampedProgress: Double {
+        guard let progress else { return 0 }
+        return min(max(progress, 0), 1)
+    }
+
+    private var showsBar: Bool { progress != nil }
+
+    private var dotSize: CGFloat { style == .compact ? 4 : 6 }
+    private var barHeight: CGFloat { style == .compact ? 2 : 3 }
+    private var fontSize: CGFloat { style == .compact ? 10 : 11 }
+    private var rowSpacing: CGFloat { style == .compact ? 5 : 6 }
+    private var effectiveSeverity: LoadSeverity {
+        severity ?? progress.map(LoadSeverity.from(usage:)) ?? .nominal
+    }
+    private var effectiveColor: Color {
+        AppColors.severityColor(effectiveSeverity, fallback: color)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: rowSpacing) {
+            HStack(spacing: 6) {
+                if showsBar {
+                    Circle()
+                        .fill(effectiveColor)
+                        .frame(width: dotSize, height: dotSize)
+                }
+
+                Text(label)
+                    .font(.system(size: fontSize, weight: .regular))
+                    .foregroundStyle(.secondary)
+
+                Spacer()
+
+                Text(value)
+                    .font(.system(size: fontSize, weight: .regular, design: .rounded))
+                    .foregroundStyle(.primary)
+                    .monospacedDigit()
+                    .fixedSize()
+            }
+
+            if showsBar {
+                GeometryReader { geo in
+                    ZStack(alignment: .leading) {
+                        Capsule()
+                            .fill(Color.secondary.opacity(0.16))
+                        Capsule()
+                            .fill(effectiveColor)
+                            .frame(width: max(geo.size.width * clampedProgress, barHeight))
+                    }
+                }
+                .frame(height: barHeight)
+            }
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(Text("\(label), \(value), \(effectiveSeverity.accessibilityDescription)"))
     }
 }
 
@@ -198,48 +523,68 @@ struct FreshnessView: View {
 struct SmallWidgetView: View {
     let stats: SystemStats
     @AppStorage(PulseSharedSettings.Keys.showBattery, store: PulseSharedSettings.defaults) private var showBattery = true
+    @AppStorage(PulseSharedSettings.Keys.showDisk, store: PulseSharedSettings.defaults) private var showDisk = true
     @AppStorage(PulseSharedSettings.Keys.showNetwork, store: PulseSharedSettings.defaults) private var showNetwork = true
 
+    private var pressure: PressureSummary {
+        PressureSummary.highest(for: stats, includesDisk: showDisk)
+    }
+
     var body: some View {
-        VStack(spacing: 8) {
-            // Header
-            HStack {
-                if showBattery {
-                    BatteryView(level: stats.batteryLevel, isCharging: stats.isCharging, hasBattery: stats.hasBattery)
-                }
-                Spacer()
-                FreshnessView(date: stats.timestamp)
-            }
+        VStack(spacing: 9) {
+            WidgetHeader(
+                stats: stats,
+                showBattery: showBattery,
+                compact: true,
+                showFreshness: false
+            )
 
             Spacer()
 
-            // Activity Rings (distinct colors)
-            HStack(spacing: 12) {
+            HStack(spacing: 14) {
                 CircularProgressView(
                     progress: stats.cpuUsage,
-                    icon: "cpu",
+                    icon: SystemMetric.cpu.icon,
                     label: "CPU",
                     size: 52,
-                    ringColor: AppColors.cpuGreen
+                    ringColor: AppColors.ringColor(metric: .cpu, severity: stats.cpuSeverity),
+                    severity: stats.cpuSeverity
                 )
 
                 CircularProgressView(
                     progress: stats.memoryUsage,
-                    icon: "memorychip",
+                    icon: SystemMetric.memory.icon,
                     label: "RAM",
                     size: 52,
-                    ringColor: AppColors.ramBlue
+                    ringColor: AppColors.ringColor(metric: .memory, severity: stats.memorySeverity),
+                    severity: stats.memorySeverity
                 )
             }
 
             Spacer()
 
-            // Network
-            if showNetwork {
-                NetworkView(up: stats.networkUp, down: stats.networkDown)
-            }
+            footer
         }
         .padding(14)
+    }
+
+    @ViewBuilder
+    private var footer: some View {
+        if pressure.severity >= .high || !showNetwork {
+            HStack {
+                PressureSummaryView(stats: stats, compact: false, includesDisk: showDisk)
+                Spacer(minLength: 0)
+            }
+        } else {
+            HStack(spacing: 6) {
+                Image(systemName: "network")
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(.secondary)
+
+                NetworkView(up: stats.networkUp, down: stats.networkDown, compact: true)
+            }
+            .frame(maxWidth: .infinity, alignment: .center)
+        }
     }
 }
 
@@ -251,90 +596,59 @@ struct MediumWidgetView: View {
     @AppStorage(PulseSharedSettings.Keys.showNetwork, store: PulseSharedSettings.defaults) private var showNetwork = true
 
     var body: some View {
-        HStack(spacing: 16) {
-            // Activity Rings (distinct colors)
-            HStack(spacing: 12) {
+        VStack(spacing: 10) {
+            WidgetHeader(stats: stats, showBattery: showBattery, compact: true)
+
+            HStack(spacing: 0) {
+                Spacer(minLength: 0)
+
                 CircularProgressView(
                     progress: stats.cpuUsage,
-                    icon: "cpu",
+                    icon: SystemMetric.cpu.icon,
                     label: "CPU",
                     size: 48,
-                    ringColor: AppColors.cpuGreen
+                    ringColor: AppColors.ringColor(metric: .cpu, severity: stats.cpuSeverity),
+                    severity: stats.cpuSeverity
                 )
+
+                Spacer(minLength: 18)
 
                 CircularProgressView(
                     progress: stats.memoryUsage,
-                    icon: "memorychip",
+                    icon: SystemMetric.memory.icon,
                     label: "RAM",
                     size: 48,
-                    ringColor: AppColors.ramBlue
+                    ringColor: AppColors.ringColor(metric: .memory, severity: stats.memorySeverity),
+                    severity: stats.memorySeverity
                 )
 
                 if showDisk {
+                    Spacer(minLength: 18)
+
                     CircularProgressView(
                         progress: stats.diskUsage,
-                        icon: "internaldrive",
+                        icon: SystemMetric.disk.icon,
                         label: "Disk",
                         size: 48,
-                        ringColor: AppColors.diskAmber
+                        ringColor: AppColors.ringColor(metric: .disk, severity: stats.diskSeverity),
+                        severity: stats.diskSeverity
                     )
                 }
+
+                Spacer(minLength: 0)
             }
 
-            // Details
-            VStack(alignment: .leading, spacing: 8) {
-                HStack {
-                    if showBattery {
-                        BatteryView(level: stats.batteryLevel, isCharging: stats.isCharging, hasBattery: stats.hasBattery)
-                    }
-                    Spacer()
-                    FreshnessView(date: stats.timestamp)
-                }
+            WidgetDivider()
 
-                Spacer()
-
-                // RAM row (blue to match ring)
-                HStack(spacing: 6) {
-                    Circle()
-                        .fill(AppColors.ramBlue)
-                        .frame(width: 6, height: 6)
-                    Text("RAM")
-                        .font(.system(size: 10, weight: .regular))
-                        .foregroundColor(.white.opacity(0.6))
-                        .frame(width: 28, alignment: .leading)
-                    Spacer()
-                    Text("\(String(format: "%.1f", stats.memoryUsed))/\(String(format: "%.0f", stats.memoryTotal))G")
-                        .font(.system(size: 10, weight: .medium, design: .rounded))
-                        .foregroundColor(.white.opacity(0.85))
-                        .fixedSize()
-                }
-
-                // Disk row (amber to match ring)
-                if showDisk {
-                    HStack(spacing: 6) {
-                        Circle()
-                            .fill(AppColors.diskAmber)
-                            .frame(width: 6, height: 6)
-                        Text("Disk")
-                            .font(.system(size: 10, weight: .regular))
-                            .foregroundColor(.white.opacity(0.6))
-                            .frame(width: 28, alignment: .leading)
-                        Spacer()
-                        Text("\(String(format: "%.0f", stats.diskAvailable))G free")
-                            .font(.system(size: 10, weight: .medium, design: .rounded))
-                            .foregroundColor(.white.opacity(0.85))
-                            .fixedSize()
-                    }
-                }
-
-                Spacer()
-
+            HStack(spacing: 8) {
+                PressureSummaryView(stats: stats, compact: false, includesDisk: showDisk)
+                Spacer(minLength: 4)
                 if showNetwork {
-                    NetworkView(up: stats.networkUp, down: stats.networkDown)
+                    NetworkView(up: stats.networkUp, down: stats.networkDown, compact: true)
                 }
             }
         }
-        .padding(16)
+        .padding(14)
     }
 }
 
@@ -348,119 +662,73 @@ struct LargeWidgetView: View {
 
     var body: some View {
         VStack(spacing: 12) {
-            // Header
-            HStack {
-                HStack(spacing: 6) {
-                    Image(systemName: "gauge.with.dots.needle.50percent")
-                        .font(.system(size: 14, weight: .medium))
-                        .foregroundColor(AppColors.ramBlue)
-
-                    Text("Pulse")
-                        .font(.system(size: 14, weight: .medium))
-                        .foregroundColor(.white)
-                }
-
-                Spacer()
-
-                HStack(spacing: 10) {
-                    FreshnessView(date: stats.timestamp)
-                    if showBattery {
-                        BatteryView(level: stats.batteryLevel, isCharging: stats.isCharging, hasBattery: stats.hasBattery)
-                    }
-                }
+            HStack(spacing: 10) {
+                WidgetHeader(stats: stats, showBattery: showBattery)
+                PressureSummaryView(stats: stats, includesDisk: showDisk)
             }
 
-            // Activity Rings (distinct colors)
-            HStack(spacing: 20) {
+            HStack(spacing: 22) {
                 CircularProgressView(
                     progress: stats.cpuUsage,
-                    icon: "cpu",
+                    icon: SystemMetric.cpu.icon,
                     label: "CPU",
                     size: 64,
-                    ringColor: AppColors.cpuGreen
+                    ringColor: AppColors.ringColor(metric: .cpu, severity: stats.cpuSeverity),
+                    severity: stats.cpuSeverity
                 )
 
                 CircularProgressView(
                     progress: stats.memoryUsage,
-                    icon: "memorychip",
+                    icon: SystemMetric.memory.icon,
                     label: "Memory",
                     size: 64,
-                    ringColor: AppColors.ramBlue
+                    ringColor: AppColors.ringColor(metric: .memory, severity: stats.memorySeverity),
+                    severity: stats.memorySeverity
                 )
 
                 if showDisk {
                     CircularProgressView(
                         progress: stats.diskUsage,
-                        icon: "internaldrive",
+                        icon: SystemMetric.disk.icon,
                         label: "Storage",
                         size: 64,
-                        ringColor: AppColors.diskAmber
+                        ringColor: AppColors.ringColor(metric: .disk, severity: stats.diskSeverity),
+                        severity: stats.diskSeverity
                     )
                 }
             }
 
             // Divider
-            Rectangle()
-                .fill(Color.white.opacity(0.08))
-                .frame(height: 1)
+            WidgetDivider()
 
             // Stats
             VStack(spacing: 10) {
-                // Memory row with blue indicator
-                HStack(spacing: 8) {
-                    Circle()
-                        .fill(AppColors.ramBlue)
-                        .frame(width: 8, height: 8)
-                    Text("Memory Used")
-                        .font(.system(size: 11, weight: .regular))
-                        .foregroundColor(.white.opacity(0.6))
-                    Spacer()
-                    Text(String(format: "%.1f / %.0f GB", stats.memoryUsed, stats.memoryTotal))
-                        .font(.system(size: 11, weight: .medium, design: .rounded))
-                        .foregroundColor(.white)
-                }
+                LinearMetricRow(
+                    label: "Memory",
+                    value: "\(PulseSharedSettings.formatGigabytes(stats.memoryUsed)) / \(PulseSharedSettings.formatGigabytes(stats.memoryTotal))",
+                    color: AppColors.ramBlue,
+                    progress: stats.memoryUsage,
+                    severity: stats.memorySeverity,
+                    style: .standard
+                )
 
                 if showDisk {
-                    // Storage row with amber indicator
-                    HStack(spacing: 8) {
-                        Circle()
-                            .fill(AppColors.diskAmber)
-                            .frame(width: 8, height: 8)
-                        Text("Storage Used")
-                            .font(.system(size: 11, weight: .regular))
-                            .foregroundColor(.white.opacity(0.6))
-                        Spacer()
-                        Text(String(format: "%.0f / %.0f GB", stats.diskUsed, stats.diskTotal))
-                            .font(.system(size: 11, weight: .medium, design: .rounded))
-                            .foregroundColor(.white)
-                    }
-
-                    HStack(spacing: 8) {
-                        Circle()
-                            .fill(AppColors.cpuGreen)
-                            .frame(width: 8, height: 8)
-                        Text("Storage Free")
-                            .font(.system(size: 11, weight: .regular))
-                            .foregroundColor(.white.opacity(0.6))
-                        Spacer()
-                        Text(String(format: "%.0f GB", stats.diskAvailable))
-                            .font(.system(size: 11, weight: .medium, design: .rounded))
-                            .foregroundColor(.white)
-                    }
+                    LinearMetricRow(
+                        label: "Storage",
+                        value: "\(PulseSharedSettings.formatGigabytes(stats.diskUsed)) of \(PulseSharedSettings.formatGigabytes(stats.diskTotal))",
+                        color: AppColors.diskAmber,
+                        progress: stats.diskUsage,
+                        severity: stats.diskSeverity,
+                        style: .standard
+                    )
 
                     if stats.diskPurgeable > 0.1 {
-                        HStack(spacing: 8) {
-                            Circle()
-                                .fill(Color.white.opacity(0.28))
-                                .frame(width: 8, height: 8)
-                            Text("Purgeable")
-                                .font(.system(size: 11, weight: .regular))
-                                .foregroundColor(.white.opacity(0.6))
-                            Spacer()
-                            Text(String(format: "%.0f GB", stats.diskPurgeable))
-                                .font(.system(size: 11, weight: .medium, design: .rounded))
-                                .foregroundColor(.white)
-                        }
+                        LinearMetricRow(
+                            label: "Purgeable",
+                            value: PulseSharedSettings.formatGigabytes(stats.diskPurgeable),
+                            color: .white.opacity(0.45),
+                            style: .standard
+                        )
                     }
                 }
 
@@ -468,11 +736,11 @@ struct LargeWidgetView: View {
                     HStack {
                         Image(systemName: "network")
                             .font(.system(size: 12, weight: .medium))
-                            .foregroundColor(AppColors.networkBlue)
+                            .foregroundStyle(.secondary)
 
                         Text("Network")
-                            .font(.system(size: 11, weight: .medium))
-                            .foregroundColor(.white.opacity(0.7))
+                            .font(.system(size: 11, weight: .regular))
+                            .foregroundStyle(.secondary)
 
                         Spacer()
 
@@ -483,29 +751,18 @@ struct LargeWidgetView: View {
 
             // Apps
             if showActiveApps, !stats.activeApps.isEmpty {
-                Rectangle()
-                    .fill(Color.white.opacity(0.08))
-                    .frame(height: 1)
+                WidgetDivider()
 
                 VStack(alignment: .leading, spacing: 8) {
                     Text("Running Apps")
-                        .font(.system(size: 10, weight: .semibold))
-                        .foregroundColor(.white.opacity(0.5))
+                        .font(.system(size: 10, weight: .regular))
+                        .foregroundStyle(.secondary)
 
-                    HStack(spacing: 6) {
-                        ForEach(stats.activeApps.prefix(4), id: \.self) { app in
-                            Text(app)
-                                .font(.system(size: 10, weight: .medium))
-                                .foregroundColor(.white)
-                                .lineLimit(1)
-                                .minimumScaleFactor(0.75)
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 4)
-                                .background(Color.white.opacity(0.1))
-                                .clipShape(Capsule())
-                        }
-                        Spacer()
-                    }
+                    Label(stats.activeApps.prefix(4).joined(separator: ", "), systemImage: "macwindow.on.rectangle")
+                        .font(.system(size: 11, weight: .regular))
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.75)
                 }
             }
         }

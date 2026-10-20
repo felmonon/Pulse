@@ -1,5 +1,15 @@
 import SwiftUI
 
+@MainActor
+final class DynamicIslandPresentation: ObservableObject {
+    @Published var isExpanded = false
+    @Published var notchHeight: CGFloat
+
+    init(notchHeight: CGFloat) {
+        self.notchHeight = notchHeight
+    }
+}
+
 // MARK: - Dynamic Island View
 /// Renders the Dynamic Island content: a compact resting pill (CPU%) that
 /// expands on click to the full system breakdown. All values come from the
@@ -9,11 +19,21 @@ import SwiftUI
 /// stats refresh.
 struct DynamicIslandView: View {
     @ObservedObject var statsController: PulseStatsController
-    @Binding var isExpanded: Bool
+    @ObservedObject var presentation: DynamicIslandPresentation
+    let onToggle: () -> Void
 
     @AppStorage(PulseSharedSettings.Keys.unitsMode, store: PulseSharedSettings.defaults) private var unitsModeRaw = PulseSharedSettings.UnitsMode.automatic.rawValue
+    @AppStorage(PulseSharedSettings.Keys.showBattery, store: PulseSharedSettings.defaults) private var showBattery = true
+    @AppStorage(PulseSharedSettings.Keys.showDisk, store: PulseSharedSettings.defaults) private var showDisk = true
+    @AppStorage(PulseSharedSettings.Keys.showNetwork, store: PulseSharedSettings.defaults) private var showNetwork = true
+    @AppStorage(PulseSharedSettings.Keys.showActiveApps, store: PulseSharedSettings.defaults) private var showActiveApps = true
 
     private var stats: SystemStats { statsController.stats }
+    private var isExpanded: Bool { presentation.isExpanded }
+
+    private var pressure: PressureSummary {
+        PressureSummary.highest(for: stats, includesDisk: showDisk)
+    }
 
     private var unitsMode: PulseSharedSettings.UnitsMode {
         PulseSharedSettings.UnitsMode(rawValue: unitsModeRaw) ?? .automatic
@@ -26,71 +46,129 @@ struct DynamicIslandView: View {
 
             content
         }
-        // The whole pill toggles on tap.
-        .onTapGesture {
-            isExpanded.toggle()
-        }
-        .frame(width: isExpanded ? DynamicIslandMath.expandedWidth : DynamicIslandMath.restingWidth)
-        .frame(maxHeight: .infinity, alignment: .top)
-        .animation(.spring(response: 0.35, dampingFraction: 0.8), value: isExpanded)
+        .onTapGesture(perform: onToggle)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .animation(.easeInOut(duration: 0.18), value: isExpanded)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(Text(accessibilityLabel))
         .accessibilityHint(Text("Click to \(isExpanded ? "collapse" : "expand")."))
+        .accessibilityAddTraits(.isButton)
     }
 
-    private var cornerRadius: CGFloat { isExpanded ? 26 : 0 }
+    private var cornerRadius: CGFloat { isExpanded ? 20 : 12 }
 
-    @ViewBuilder
     private var content: some View {
-        if isExpanded {
-            expandedContent
-        } else {
-            restingContent
+        VStack(spacing: 0) {
+            Color.clear
+                .frame(height: max(presentation.notchHeight, 1))
+                .allowsHitTesting(false)
+
+            if isExpanded {
+                expandedContent
+            } else {
+                restingContent
+            }
         }
     }
 
     private var restingContent: some View {
-        HStack(spacing: 6) {
-            Image(systemName: "cpu")
+        HStack(spacing: 7) {
+            Image(systemName: pressure.severity >= .high ? "exclamationmark.triangle.fill" : "waveform.path.ecg")
                 .font(.system(size: 9, weight: .semibold))
-                .foregroundStyle(AppColors.cpuGreen)
-            Text(PulseSharedSettings.percent(stats.cpuUsage))
+                .foregroundStyle(pressureColor)
+
+            Text("\(pressure.label) \(pressure.percentText)")
                 .font(.system(size: 11, weight: .semibold, design: .rounded))
                 .foregroundStyle(.white)
                 .monospacedDigit()
+
+            if pressure.severity >= .high {
+                Text(pressureStatus)
+                    .font(.system(size: 9, weight: .medium, design: .rounded))
+                    .foregroundStyle(pressureColor)
+            }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(.horizontal, 12)
     }
 
     private var expandedContent: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 7) {
+                Image(systemName: "waveform.path.ecg")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(AppColors.ramBlue)
+
+                Text("Pulse")
+                    .font(.system(size: 12, weight: .semibold, design: .rounded))
+                    .foregroundStyle(.white)
+
+                Spacer(minLength: 8)
+
+                Text("\(pressure.label) \(pressure.percentText) \(pressureStatus)")
+                    .font(.system(size: 10, weight: .medium, design: .rounded))
+                    .foregroundStyle(pressureColor)
+                    .monospacedDigit()
+            }
+
+            Rectangle()
+                .fill(Color.white.opacity(0.12))
+                .frame(height: 1)
+
             metricRow(icon: "cpu", label: "CPU", value: PulseSharedSettings.percent(stats.cpuUsage), color: AppColors.cpuGreen)
             metricRow(icon: "memorychip", label: "RAM", value: ramValue, color: AppColors.ramBlue)
-            metricRow(icon: "internaldrive", label: "Disk", value: diskValue, color: AppColors.diskAmber)
-            metricRow(icon: batteryIcon, label: "Battery", value: batteryValue, color: batteryColor)
-            metricRow(icon: "network", label: "Network", value: networkValue, color: AppColors.networkBlue)
-            if !stats.activeApps.isEmpty {
-                metricRow(icon: "macwindow.on.rectangle", label: "Apps", value: stats.activeApps.prefix(3).joined(separator: ", "), color: .white.opacity(0.6))
+
+            if showDisk {
+                metricRow(icon: "internaldrive", label: "Disk", value: diskValue, color: AppColors.diskAmber)
             }
+
+            if showBattery {
+                metricRow(icon: batteryIcon, label: "Battery", value: batteryValue, color: batteryColor)
+            }
+
+            if showNetwork {
+                metricRow(icon: "network", label: "Network", value: networkValue, color: AppColors.networkBlue)
+            }
+
+            if showActiveApps, !stats.activeApps.isEmpty {
+                metricRow(
+                    icon: "macwindow.on.rectangle",
+                    label: "Apps",
+                    value: stats.activeApps.prefix(2).joined(separator: ", "),
+                    color: .white.opacity(0.72)
+                )
+            }
+
             if stats.isStale {
                 HStack(spacing: 3) {
-                    Image(systemName: "clock.badge.exclamationmark").font(.system(size: 8))
-                    Text("Stale").font(.system(size: 9))
+                    Image(systemName: "clock.badge.exclamationmark")
+                        .font(.system(size: 9))
+                    Text("Stats need a refresh")
+                        .font(.system(size: 10))
                 }
                 .foregroundStyle(AppColors.diskAmber)
             }
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 10)
-        .frame(width: DynamicIslandMath.expandedWidth, alignment: .leading)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
     private func metricRow(icon: String, label: String, value: String, color: Color) -> some View {
         HStack(spacing: 6) {
-            Image(systemName: icon).font(.system(size: 8, weight: .medium)).foregroundStyle(color)
-            Text(label).font(.system(size: 9, weight: .regular)).foregroundStyle(.white.opacity(0.55))
+            Image(systemName: icon)
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(color)
+                .frame(width: 13)
+
+            Text(label)
+                .font(.system(size: 10, weight: .regular))
+                .foregroundStyle(.white.opacity(0.62))
+
             Spacer(minLength: 8)
+
             Text(value)
-                .font(.system(size: 9, weight: .regular, design: .rounded))
+                .font(.system(size: 10, weight: .medium, design: .rounded))
                 .foregroundStyle(.white)
                 .monospacedDigit()
                 .lineLimit(1)
@@ -110,7 +188,7 @@ struct DynamicIslandView: View {
 
     private var batteryValue: String {
         guard stats.hasBattery else { return "AC" }
-        return "\(stats.batteryLevel)%\(stats.isCharging ? " ⚡" : "")"
+        return "\(stats.batteryLevel)%\(stats.isCharging ? " charging" : "")"
     }
 
     private var batteryIcon: String {
@@ -126,16 +204,53 @@ struct DynamicIslandView: View {
     }
 
     private var networkValue: String {
-        "↓\(PulseSharedSettings.formatSpeed(stats.networkDown, unitsMode: unitsMode)) ↑\(PulseSharedSettings.formatSpeed(stats.networkUp, unitsMode: unitsMode))"
+        "Down \(PulseSharedSettings.formatSpeed(stats.networkDown, unitsMode: unitsMode))  Up \(PulseSharedSettings.formatSpeed(stats.networkUp, unitsMode: unitsMode))"
+    }
+
+    private var pressureColor: Color {
+        switch pressure.severity {
+        case .nominal:
+            return AppColors.cpuGreen
+        case .moderate:
+            return pressure.color
+        case .high:
+            return AppColors.diskAmber
+        case .critical:
+            return AppColors.critical
+        }
+    }
+
+    private var pressureStatus: String {
+        switch pressure.severity {
+        case .nominal:
+            return "OK"
+        case .moderate:
+            return "Normal"
+        case .high:
+            return "High"
+        case .critical:
+            return "Critical"
+        }
     }
 
     private var accessibilityLabel: String {
         isExpanded
             ? "Pulse island expanded. \(expandedContentSummary)"
-            : "Pulse island. CPU \(PulseSharedSettings.percent(stats.cpuUsage))."
+            : "Pulse island. \(pressure.label) \(pressure.percentText), \(pressureStatus)."
     }
 
     private var expandedContentSummary: String {
-        "CPU \(PulseSharedSettings.percent(stats.cpuUsage)), RAM \(PulseSharedSettings.percent(stats.memoryUsage)), disk \(diskValue), battery \(batteryValue), network \(networkValue)."
+        var values = [
+            "CPU \(PulseSharedSettings.percent(stats.cpuUsage))",
+            "RAM \(PulseSharedSettings.percent(stats.memoryUsage))"
+        ]
+        if showDisk { values.append("disk \(diskValue)") }
+        if showBattery { values.append("battery \(batteryValue)") }
+        if showNetwork { values.append("network \(networkValue)") }
+        if showActiveApps, !stats.activeApps.isEmpty {
+            values.append("active apps \(stats.activeApps.prefix(2).joined(separator: ", "))")
+        }
+        if stats.isStale { values.append("stats need a refresh") }
+        return values.joined(separator: ", ") + "."
     }
 }
