@@ -11,6 +11,33 @@ enum MemoryPressureLevel: Int, Codable {
     case critical = 4
 }
 
+/// Mirrors `ProcessInfo.ThermalState` in a Codable form the widget can share.
+enum ThermalLevel: Int, Codable {
+    case nominal = 0
+    case fair = 1
+    case serious = 2
+    case critical = 3
+
+    init(_ state: ProcessInfo.ThermalState) {
+        switch state {
+        case .nominal: self = .nominal
+        case .fair: self = .fair
+        case .serious: self = .serious
+        case .critical: self = .critical
+        @unknown default: self = .nominal
+        }
+    }
+
+    var title: String {
+        switch self {
+        case .nominal: return "Normal"
+        case .fair: return "Warm"
+        case .serious: return "Hot"
+        case .critical: return "Critical"
+        }
+    }
+}
+
 /// Coarse classification of how loaded a metric is, used to tint rings and
 /// give the widget a glanceable "is something under pressure?" signal.
 enum LoadSeverity: Int, Comparable {
@@ -89,6 +116,21 @@ struct SystemStats: Codable {
     var activeApps: [String]
     var timestamp: Date
 
+    // Activity Monitor–style detail. Defaulted so older call sites and the
+    // placeholder keep compiling without spelling every field out.
+    var cpuUser: Double = 0
+    var cpuSystem: Double = 0
+    var cpuCoreUsage: [Double] = []
+    var memoryApp: Double = 0 // GB
+    var memoryWired: Double = 0 // GB
+    var memoryCompressed: Double = 0 // GB
+    var memoryCached: Double = 0 // GB
+    var swapUsed: Double = 0 // GB
+    var isPluggedIn: Bool = false
+    var batteryMinutesRemaining: Int? = nil
+    var thermalLevel: ThermalLevel = .nominal
+    var uptime: TimeInterval = 0
+
     var isStale: Bool {
         Date().timeIntervalSince(timestamp) > 120
     }
@@ -123,7 +165,19 @@ struct SystemStats: Codable {
             networkUp: 125.4,
             networkDown: 892.1,
             activeApps: ["Safari", "Xcode", "Slack"],
-            timestamp: Date()
+            timestamp: Date(),
+            cpuUser: 0.31,
+            cpuSystem: 0.14,
+            cpuCoreUsage: [0.72, 0.64, 0.58, 0.41, 0.33, 0.28, 0.22, 0.18, 0.12, 0.09],
+            memoryApp: 6.4,
+            memoryWired: 2.3,
+            memoryCompressed: 1.5,
+            memoryCached: 3.9,
+            swapUsed: 0,
+            isPluggedIn: true,
+            batteryMinutesRemaining: 48,
+            thermalLevel: .nominal,
+            uptime: 273_600
         )
     }
 }
@@ -140,7 +194,9 @@ enum PulseSharedDefaults {
         "settings.showDisk",
         "settings.showNetwork",
         "settings.showActiveApps",
-        "settings.islandEnabled"
+        "settings.islandEnabled",
+        "settings.islandChargingActivity",
+        "settings.menuBarStyle"
     ]
 
     static let defaults: UserDefaults = {
@@ -201,6 +257,25 @@ enum PulseSharedSettings {
         static let showNetwork = "settings.showNetwork"
         static let showActiveApps = "settings.showActiveApps"
         static let islandEnabled = "settings.islandEnabled"
+        static let islandChargingActivity = "settings.islandChargingActivity"
+        static let menuBarStyle = "settings.menuBarStyle"
+    }
+
+    /// What the menu-bar item shows next to its glyph.
+    enum MenuBarStyle: String, CaseIterable, Identifiable {
+        case iconOnly = "icon"
+        case busiest = "busiest"
+        case cpuAndMemory = "cpuMemory"
+
+        var id: String { rawValue }
+
+        var title: String {
+            switch self {
+            case .iconOnly: return "Icon Only"
+            case .busiest: return "Busiest Metric"
+            case .cpuAndMemory: return "CPU and Memory"
+            }
+        }
     }
 
     enum UnitsMode: String, CaseIterable, Identifiable {
@@ -231,6 +306,34 @@ enum PulseSharedSettings {
 
     static func intervalLabel(_ interval: TimeInterval) -> String {
         String(format: "%.0fs", interval)
+    }
+
+    /// Settings-style phrasing: "Every second", "Every 5 seconds".
+    static func intervalDescription(_ interval: TimeInterval) -> String {
+        let seconds = Int(clampedRefreshInterval(interval).rounded())
+        switch seconds {
+        case 1: return "Every second"
+        case 60: return "Every minute"
+        default: return "Every \(seconds) seconds"
+        }
+    }
+
+    /// Compact uptime like "3d 4h", "5h 12m" or "8m".
+    static func formatUptime(_ uptime: TimeInterval) -> String {
+        guard uptime.isFinite, uptime > 0 else { return "—" }
+        let totalMinutes = Int(uptime / 60)
+        let days = totalMinutes / 1440
+        let hours = (totalMinutes % 1440) / 60
+        let minutes = totalMinutes % 60
+        if days > 0 { return "\(days)d \(hours)h" }
+        if hours > 0 { return "\(hours)h \(minutes)m" }
+        return "\(minutes)m"
+    }
+
+    /// Battery-menu phrasing: "2:05".
+    static func formatBatteryTime(minutes: Int) -> String {
+        let clamped = max(minutes, 0)
+        return String(format: "%d:%02d", clamped / 60, clamped % 60)
     }
 
     static func percent(_ value: Double) -> String {
@@ -299,6 +402,49 @@ enum SystemStatsMath {
         let totalBytes: Double
         let availableBytes: Double
         let purgeableBytes: Double
+    }
+
+    /// Raw scheduler ticks for one logical core.
+    struct CPUCoreTicks: Equatable {
+        let user: UInt64
+        let system: UInt64
+        let idle: UInt64
+        let nice: UInt64
+
+        var used: UInt64 { user + system + nice }
+        var total: UInt64 { used + idle }
+    }
+
+    /// Utilization split the way Activity Monitor reports it.
+    struct CPUBreakdown: Equatable {
+        let total: Double
+        let user: Double
+        let system: Double
+        let cores: [Double]
+    }
+
+    /// Memory split the way Activity Monitor reports it. "Used" is App +
+    /// Wired + Compressed; cached files are reclaimable and not counted.
+    struct MemoryBreakdown: Equatable {
+        let totalBytes: Double
+        let usedBytes: Double
+        let appBytes: Double
+        let wiredBytes: Double
+        let compressedBytes: Double
+        let cachedBytes: Double
+
+        var usage: Double {
+            totalBytes > 0 ? SystemStatsMath.unitInterval(usedBytes / totalBytes) : 0
+        }
+
+        static let empty = MemoryBreakdown(
+            totalBytes: 0,
+            usedBytes: 0,
+            appBytes: 0,
+            wiredBytes: 0,
+            compressedBytes: 0,
+            cachedBytes: 0
+        )
     }
 
     static func cpuUsage(previous: CPUCounters?, current: CPUCounters) -> Double {
@@ -421,9 +567,174 @@ enum SystemStatsMath {
         return min(speed, maxDisplayableSpeed)
     }
 
+    /// Per-core and user/system utilization from two tick samples. A core
+    /// whose counters went backwards (or a changed core count) falls back to
+    /// its cumulative ticks, matching `cpuUsage(previous:current:)`.
+    static func cpuBreakdown(previous: [CPUCoreTicks]?, current: [CPUCoreTicks]) -> CPUBreakdown {
+        let comparable = previous.map { $0.count == current.count } ?? false
+        var userDelta: UInt64 = 0
+        var systemDelta: UInt64 = 0
+        var totalDelta: UInt64 = 0
+        var cores: [Double] = []
+        cores.reserveCapacity(current.count)
+
+        for (index, core) in current.enumerated() {
+            var delta = core
+            if comparable, let earlier = previous?[index],
+               core.user >= earlier.user,
+               core.system >= earlier.system,
+               core.idle >= earlier.idle,
+               core.nice >= earlier.nice {
+                delta = CPUCoreTicks(
+                    user: core.user - earlier.user,
+                    system: core.system - earlier.system,
+                    idle: core.idle - earlier.idle,
+                    nice: core.nice - earlier.nice
+                )
+            }
+
+            userDelta += delta.user + delta.nice
+            systemDelta += delta.system
+            totalDelta += delta.total
+            cores.append(delta.total > 0 ? unitInterval(Double(delta.used) / Double(delta.total)) : 0)
+        }
+
+        guard totalDelta > 0 else {
+            return CPUBreakdown(total: 0, user: 0, system: 0, cores: cores)
+        }
+
+        let user = unitInterval(Double(userDelta) / Double(totalDelta))
+        let system = unitInterval(Double(systemDelta) / Double(totalDelta))
+        return CPUBreakdown(total: unitInterval(user + system), user: user, system: system, cores: cores)
+    }
+
+    static func memoryBreakdown(
+        totalBytes: Double,
+        pageSize: Double,
+        internalPages: UInt64,
+        purgeablePages: UInt64,
+        externalPages: UInt64,
+        wiredPages: UInt64,
+        compressorPages: UInt64
+    ) -> MemoryBreakdown {
+        guard totalBytes.isFinite, totalBytes > 0, pageSize.isFinite, pageSize > 0 else {
+            return .empty
+        }
+
+        let appPages = internalPages > purgeablePages ? internalPages - purgeablePages : 0
+        let app = Double(appPages) * pageSize
+        let wired = Double(wiredPages) * pageSize
+        let compressed = Double(compressorPages) * pageSize
+        let used = min(app + wired + compressed, totalBytes)
+        let cached = min(Double(externalPages + purgeablePages) * pageSize, totalBytes - used)
+
+        return MemoryBreakdown(
+            totalBytes: totalBytes,
+            usedBytes: used,
+            appBytes: app,
+            wiredBytes: wired,
+            compressedBytes: compressed,
+            cachedBytes: max(cached, 0)
+        )
+    }
+
+    /// IOKit reports -1 while it is still estimating; only surface a time
+    /// when the relevant estimate is real.
+    static func batteryMinutes(
+        isCharging: Bool,
+        isPluggedIn: Bool,
+        timeToEmpty: Int?,
+        timeToFull: Int?
+    ) -> Int? {
+        if isCharging {
+            guard let timeToFull, timeToFull > 0 else { return nil }
+            return timeToFull
+        }
+        guard !isPluggedIn, let timeToEmpty, timeToEmpty > 0 else { return nil }
+        return timeToEmpty
+    }
+
     private static func clamp(_ value: Double) -> Double {
         unitInterval(value)
     }
+}
+
+// MARK: - Metric History
+/// A rolling window of recent samples that drives the live charts. Samples
+/// carry a monotonically increasing id so charts can plot by position.
+struct MetricSample: Identifiable, Equatable {
+    let id: Int
+    let cpu: Double
+    let memory: Double
+    let networkUp: Double
+    let networkDown: Double
+}
+
+struct MetricHistory: Equatable {
+    let capacity: Int
+    private(set) var samples: [MetricSample] = []
+    private var nextID = 0
+
+    init(capacity: Int = 90) {
+        self.capacity = max(capacity, 2)
+    }
+
+    mutating func append(cpu: Double, memory: Double, networkUp: Double, networkDown: Double) {
+        samples.append(
+            MetricSample(
+                id: nextID,
+                cpu: SystemStatsMath.unitInterval(cpu),
+                memory: SystemStatsMath.unitInterval(memory),
+                networkUp: SystemStatsMath.sanitizeSpeed(networkUp),
+                networkDown: SystemStatsMath.sanitizeSpeed(networkDown)
+            )
+        )
+        nextID += 1
+        if samples.count > capacity {
+            samples.removeFirst(samples.count - capacity)
+        }
+    }
+
+    mutating func append(_ stats: SystemStats) {
+        append(
+            cpu: stats.cpuUsage,
+            memory: stats.memoryUsage,
+            networkUp: stats.networkUp,
+            networkDown: stats.networkDown
+        )
+    }
+
+    /// Highest combined network speed in the window, floored so a quiet link
+    /// still draws a flat line rather than a scaled-up noise floor.
+    var networkCeiling: Double {
+        let peak = samples.map { max($0.networkUp, $0.networkDown) }.max() ?? 0
+        return max(peak * 1.15, 64)
+    }
+}
+
+// MARK: - Static Machine Info
+enum MachineInfo {
+    static let chipName: String = {
+        var size = 0
+        guard sysctlbyname("machdep.cpu.brand_string", nil, &size, nil, 0) == 0, size > 1 else {
+            return "Apple silicon"
+        }
+        var buffer = [CChar](repeating: 0, count: size)
+        guard sysctlbyname("machdep.cpu.brand_string", &buffer, &size, nil, 0) == 0 else {
+            return "Apple silicon"
+        }
+        let name = String(cString: buffer).trimmingCharacters(in: .whitespaces)
+        return name.isEmpty ? "Apple silicon" : name
+    }()
+
+    static let coreCount = ProcessInfo.processInfo.activeProcessorCount
+
+    static let osVersion: String = {
+        let version = ProcessInfo.processInfo.operatingSystemVersion
+        return version.patchVersion > 0
+            ? "macOS \(version.majorVersion).\(version.minorVersion).\(version.patchVersion)"
+            : "macOS \(version.majorVersion).\(version.minorVersion)"
+    }()
 }
 
 // MARK: - System Monitor
@@ -431,7 +742,7 @@ class SystemMonitor {
     static let shared = SystemMonitor()
 
     private let samplingLock = NSLock()
-    private var previousCPUCounters: SystemStatsMath.CPUCounters?
+    private var previousCPUTicks: [SystemStatsMath.CPUCoreTicks]?
     private var previousNetworkCounters: SystemStatsMath.NetworkCounters?
 
     // EMA-smoothed display values. Raw CPU deltas between two samples are
@@ -440,6 +751,9 @@ class SystemMonitor {
     private static let cpuSmoothingAlpha: Double = 0.4
     private static let networkSmoothingAlpha: Double = 0.5
     private var smoothedCPU: Double?
+    private var smoothedCPUUser: Double?
+    private var smoothedCPUSystem: Double?
+    private var smoothedCores: [Double] = []
     private var smoothedNetworkUp: Double?
     private var smoothedNetworkDown: Double?
 
@@ -453,13 +767,22 @@ class SystemMonitor {
         let battery = getBatteryLevel()
         let network = getNetworkSpeed()
 
-        let rawCPU = getCPUUsage()
-        let cpu = SystemStatsMath.smoothed(
-            previous: smoothedCPU,
-            current: rawCPU,
-            alpha: SystemMonitor.cpuSmoothingAlpha
-        )
+        let breakdown = getCPUBreakdown()
+        let alpha = SystemMonitor.cpuSmoothingAlpha
+        let cpu = SystemStatsMath.smoothed(previous: smoothedCPU, current: breakdown.total, alpha: alpha)
+        let cpuUser = SystemStatsMath.smoothed(previous: smoothedCPUUser, current: breakdown.user, alpha: alpha)
+        let cpuSystem = SystemStatsMath.smoothed(previous: smoothedCPUSystem, current: breakdown.system, alpha: alpha)
         smoothedCPU = cpu
+        smoothedCPUUser = cpuUser
+        smoothedCPUSystem = cpuSystem
+
+        if smoothedCores.count == breakdown.cores.count {
+            smoothedCores = zip(smoothedCores, breakdown.cores).map {
+                SystemStatsMath.smoothed(previous: $0, current: $1, alpha: alpha)
+            }
+        } else {
+            smoothedCores = breakdown.cores
+        }
 
         let netUp = SystemStatsMath.smoothed(
             previous: smoothedNetworkUp,
@@ -474,11 +797,13 @@ class SystemMonitor {
         smoothedNetworkUp = netUp
         smoothedNetworkDown = netDown
 
+        let gigabyte = 1_073_741_824.0
+
         return SystemStats(
             cpuUsage: cpu,
-            memoryUsage: memory.percentage,
-            memoryUsed: memory.used,
-            memoryTotal: memory.total,
+            memoryUsage: memory.breakdown.usage,
+            memoryUsed: memory.breakdown.usedBytes / gigabyte,
+            memoryTotal: memory.breakdown.totalBytes / gigabyte,
             memoryPressureLevel: memory.pressureLevel,
             diskUsage: disk.percentage,
             diskUsed: disk.used,
@@ -491,24 +816,36 @@ class SystemMonitor {
             networkUp: netUp,
             networkDown: netDown,
             activeApps: getActiveApps(),
-            timestamp: Date()
+            timestamp: Date(),
+            cpuUser: cpuUser,
+            cpuSystem: cpuSystem,
+            cpuCoreUsage: smoothedCores,
+            memoryApp: memory.breakdown.appBytes / gigabyte,
+            memoryWired: memory.breakdown.wiredBytes / gigabyte,
+            memoryCompressed: memory.breakdown.compressedBytes / gigabyte,
+            memoryCached: memory.breakdown.cachedBytes / gigabyte,
+            swapUsed: memory.swapBytes / gigabyte,
+            isPluggedIn: battery.isPluggedIn,
+            batteryMinutesRemaining: battery.minutesRemaining,
+            thermalLevel: ThermalLevel(ProcessInfo.processInfo.thermalState),
+            uptime: ProcessInfo.processInfo.systemUptime
         )
     }
 
     // MARK: - CPU Usage
-    private func getCPUUsage() -> Double {
-        guard let current = getCPUCounters(), current.total > 0 else {
-            return 0.0
+    private func getCPUBreakdown() -> SystemStatsMath.CPUBreakdown {
+        guard let current = getCPUTicks(), !current.isEmpty else {
+            return SystemStatsMath.CPUBreakdown(total: 0, user: 0, system: 0, cores: [])
         }
 
         defer {
-            previousCPUCounters = current
+            previousCPUTicks = current
         }
 
-        return SystemStatsMath.cpuUsage(previous: previousCPUCounters, current: current)
+        return SystemStatsMath.cpuBreakdown(previous: previousCPUTicks, current: current)
     }
 
-    private func getCPUCounters() -> SystemStatsMath.CPUCounters? {
+    private func getCPUTicks() -> [SystemStatsMath.CPUCoreTicks]? {
         var cpuInfo: processor_info_array_t?
         var numCpuInfo: mach_msg_type_number_t = 0
         var numCPUs: natural_t = 0
@@ -531,28 +868,34 @@ class SystemMonitor {
             )
         }
 
-        var usedTicks: UInt64 = 0
-        var totalTicks: UInt64 = 0
+        var cores: [SystemStatsMath.CPUCoreTicks] = []
+        cores.reserveCapacity(Int(numCPUs))
+
+        // Ticks are unsigned counters stored in signed slots; reinterpret the
+        // bits so a long-running Mac never reads a wrapped counter as zero.
+        func ticks(_ value: integer_t) -> UInt64 {
+            UInt64(UInt32(bitPattern: value))
+        }
 
         for i in 0..<Int(numCPUs) {
             let offset = Int(CPU_STATE_MAX) * i
-            let user = UInt64(Int64(max(info[offset + Int(CPU_STATE_USER)], 0)))
-            let system = UInt64(Int64(max(info[offset + Int(CPU_STATE_SYSTEM)], 0)))
-            let idle = UInt64(Int64(max(info[offset + Int(CPU_STATE_IDLE)], 0)))
-            let nice = UInt64(Int64(max(info[offset + Int(CPU_STATE_NICE)], 0)))
-
-            usedTicks += user + system + nice
-            totalTicks += user + system + idle + nice
+            cores.append(
+                SystemStatsMath.CPUCoreTicks(
+                    user: ticks(info[offset + Int(CPU_STATE_USER)]),
+                    system: ticks(info[offset + Int(CPU_STATE_SYSTEM)]),
+                    idle: ticks(info[offset + Int(CPU_STATE_IDLE)]),
+                    nice: ticks(info[offset + Int(CPU_STATE_NICE)])
+                )
+            )
         }
 
-        return SystemStatsMath.CPUCounters(used: usedTicks, total: totalTicks)
+        return cores
     }
 
     // MARK: - Memory Usage
     private func getMemoryUsage() -> (
-        percentage: Double,
-        used: Double,
-        total: Double,
+        breakdown: SystemStatsMath.MemoryBreakdown,
+        swapBytes: Double,
         pressureLevel: MemoryPressureLevel?
     ) {
         var stats = vm_statistics64()
@@ -565,25 +908,29 @@ class SystemMonitor {
         }
 
         guard result == KERN_SUCCESS else {
-            return (0, 0, 0, getMemoryPressureLevel())
+            return (.empty, getSwapUsedBytes(), getMemoryPressureLevel())
         }
 
-        let pageSize = Double(vm_kernel_page_size)
-        let totalMemory = Double(ProcessInfo.processInfo.physicalMemory)
-
-        let activeMemory = Double(stats.active_count) * pageSize
-        let wiredMemory = Double(stats.wire_count) * pageSize
-        let compressedMemory = Double(stats.compressor_page_count) * pageSize
-
-        let usedMemory = activeMemory + wiredMemory + compressedMemory
-        let percentage = totalMemory > 0 ? usedMemory / totalMemory : 0
-
-        return (
-            SystemStatsMath.unitInterval(percentage),
-            usedMemory / 1_073_741_824,
-            totalMemory / 1_073_741_824,
-            getMemoryPressureLevel()
+        let breakdown = SystemStatsMath.memoryBreakdown(
+            totalBytes: Double(ProcessInfo.processInfo.physicalMemory),
+            pageSize: Double(vm_kernel_page_size),
+            internalPages: UInt64(stats.internal_page_count),
+            purgeablePages: UInt64(stats.purgeable_count),
+            externalPages: UInt64(stats.external_page_count),
+            wiredPages: UInt64(stats.wire_count),
+            compressorPages: UInt64(stats.compressor_page_count)
         )
+
+        return (breakdown, getSwapUsedBytes(), getMemoryPressureLevel())
+    }
+
+    private func getSwapUsedBytes() -> Double {
+        var usage = xsw_usage()
+        var size = MemoryLayout<xsw_usage>.size
+        guard sysctlbyname("vm.swapusage", &usage, &size, nil, 0) == 0 else {
+            return 0
+        }
+        return Double(usage.xsu_used)
     }
 
     private func getMemoryPressureLevel() -> MemoryPressureLevel? {
@@ -636,7 +983,13 @@ class SystemMonitor {
     }
 
     // MARK: - Battery
-    private func getBatteryLevel() -> (level: Int, isCharging: Bool, hasBattery: Bool) {
+    private func getBatteryLevel() -> (
+        level: Int,
+        isCharging: Bool,
+        hasBattery: Bool,
+        isPluggedIn: Bool,
+        minutesRemaining: Int?
+    ) {
         let snapshot = IOPSCopyPowerSourcesInfo().takeRetainedValue()
         let sources = IOPSCopyPowerSourcesList(snapshot).takeRetainedValue() as Array
 
@@ -644,12 +997,20 @@ class SystemMonitor {
             if let info = IOPSGetPowerSourceDescription(snapshot, source).takeUnretainedValue() as? [String: Any] {
                 if let capacity = info[kIOPSCurrentCapacityKey] as? Int,
                    let isCharging = info[kIOPSIsChargingKey] as? Bool {
-                    return (capacity, isCharging, true)
+                    let isPluggedIn = (info[kIOPSPowerSourceStateKey] as? String) == kIOPSACPowerValue
+                    let minutes = SystemStatsMath.batteryMinutes(
+                        isCharging: isCharging,
+                        isPluggedIn: isPluggedIn,
+                        timeToEmpty: info[kIOPSTimeToEmptyKey] as? Int,
+                        timeToFull: info[kIOPSTimeToFullChargeKey] as? Int
+                    )
+                    return (capacity, isCharging, true, isPluggedIn, minutes)
                 }
             }
         }
 
-        return (0, false, false)
+        // Desktop Macs have no battery and are always on AC power.
+        return (0, false, false, true, nil)
     }
 
     // MARK: - Network Speed
@@ -740,14 +1101,15 @@ enum DynamicIslandMath {
     /// inset greater than this implies the menu bar sits beside a notch.
     static let menuBarOnlyHeight: CGFloat = 24
 
-    /// The panel reserves the physical cutout, then places all readable content
-    /// in a shelf below it. Widths expand from the measured cutout when AppKit
-    /// exposes both auxiliary menu-bar areas.
+    /// At rest the island is exactly as tall as the notch and extends a
+    /// compact "ear" either side of the cutout, like the iPhone's Dynamic
+    /// Island. Expanded, it grows downward into a full card. Widths derive
+    /// from the measured cutout when AppKit exposes both auxiliary areas.
     static let fallbackNotchWidth: CGFloat = 180
-    static let restingShelfHeight: CGFloat = 26
-    static let expandedContentHeight: CGFloat = 196
-    static let restingHorizontalPadding: CGFloat = 28
-    static let expandedHorizontalPadding: CGFloat = 96
+    static let compactEarWidth: CGFloat = 66
+    static let expandedContentHeight: CGFloat = 168
+    static let expandedMinimumWidth: CGFloat = 470
+    static let expandedHorizontalPadding: CGFloat = 230
 
     /// Returns true when the screen has a physical notch.
     ///
@@ -761,25 +1123,27 @@ enum DynamicIslandMath {
         return safeAreaTopInset > menuBarOnlyHeight
     }
 
+    static func measuredNotchWidth(_ notchWidth: CGFloat) -> CGFloat {
+        notchWidth.isFinite && notchWidth > 0 ? notchWidth : fallbackNotchWidth
+    }
+
     static func restingWidth(notchWidth: CGFloat) -> CGFloat {
-        let measuredWidth = notchWidth.isFinite && notchWidth > 0 ? notchWidth : fallbackNotchWidth
-        return max(measuredWidth + restingHorizontalPadding, 208)
+        measuredNotchWidth(notchWidth) + compactEarWidth * 2
     }
 
     static func expandedWidth(notchWidth: CGFloat) -> CGFloat {
-        let measuredWidth = notchWidth.isFinite && notchWidth > 0 ? notchWidth : fallbackNotchWidth
-        return max(measuredWidth + expandedHorizontalPadding, 300)
+        max(measuredNotchWidth(notchWidth) + expandedHorizontalPadding, expandedMinimumWidth)
     }
 
-    /// The resting panel keeps the cutout area empty and adds a compact shelf
-    /// below it. The top edge remains pinned to the top of the screen.
+    /// The resting island is notch-height so it reads as part of the
+    /// hardware, with content only in the ears beside the cutout. The top
+    /// edge remains pinned to the top of the screen.
     static func restingFrame(
         screen: CGRect,
         notchHeight: CGFloat,
         notchWidth: CGFloat = fallbackNotchWidth
     ) -> CGRect {
-        let cutoutHeight = notchHeight.isFinite ? max(notchHeight, 1) : 1
-        let height = cutoutHeight + restingShelfHeight
+        let height = notchHeight.isFinite ? max(notchHeight, 1) : 1
         let width = restingWidth(notchWidth: notchWidth)
         let x = screen.midX - width / 2
         let y = screen.maxY - height  // top edge at screen top

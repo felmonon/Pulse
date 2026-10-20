@@ -17,6 +17,11 @@
 		A1000008 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A2000004; };
 		D1000010 /* DynamicIslandView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D2000010; };
 		D1000011 /* DynamicIslandPanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = D2000011; };
+		E1000001 /* DashboardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E2000001; };
+		E1000002 /* MenuBarPanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = E2000002; };
+		E1000003 /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E2000003; };
+		E1000004 /* PulseDesign.swift in Sources */ = {isa = PBXBuildFile; fileRef = E2000004; };
+		E1000005 /* PulseDesign.swift in Sources */ = {isa = PBXBuildFile; fileRef = E2000004; };
 		A1000011 /* WidgetKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000011; };
 		A1000012 /* SwiftUI.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000012; };
 		A1000013 /* IOKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000013; };
@@ -55,6 +60,10 @@
 		A2000005 /* MacMonitorApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MacMonitorApp.swift; sourceTree = "<group>"; };
 		D2000010 /* DynamicIslandView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DynamicIslandView.swift; sourceTree = "<group>"; };
 		D2000011 /* DynamicIslandPanel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DynamicIslandPanel.swift; sourceTree = "<group>"; };
+		E2000001 /* DashboardView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DashboardView.swift; sourceTree = "<group>"; };
+		E2000002 /* MenuBarPanel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenuBarPanel.swift; sourceTree = "<group>"; };
+		E2000003 /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
+		E2000004 /* PulseDesign.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PulseDesign.swift; sourceTree = "<group>"; };
 		A2000006 /* MacMonitorApp.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = MacMonitorApp.entitlements; sourceTree = "<group>"; };
 		A2000007 /* MacMonitorWidgetExtension.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = MacMonitorWidgetExtension.entitlements; sourceTree = "<group>"; };
 		A2000011 /* WidgetKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = WidgetKit.framework; path = System/Library/Frameworks/WidgetKit.framework; sourceTree = SDKROOT; };
@@ -97,6 +106,10 @@
 				A2000005 /* MacMonitorApp.swift */,
 				D2000010 /* DynamicIslandView.swift */,
 				D2000011 /* DynamicIslandPanel.swift */,
+				E2000001 /* DashboardView.swift */,
+				E2000002 /* MenuBarPanel.swift */,
+				E2000003 /* SettingsView.swift */,
+				E2000004 /* PulseDesign.swift */,
 				A2000006 /* MacMonitorApp.entitlements */,
 				A2000007 /* MacMonitorWidgetExtension.entitlements */,
 			);
@@ -237,6 +250,7 @@
 				A1000001 /* MacMonitorWidget.swift in Sources */,
 				A1000002 /* WidgetViews.swift in Sources */,
 				A1000003 /* SystemStats.swift in Sources */,
+				E1000004 /* PulseDesign.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -249,6 +263,10 @@
 				D1000011 /* DynamicIslandPanel.swift in Sources */,
 				A1000006 /* WidgetViews.swift in Sources */,
 				A1000007 /* SystemStats.swift in Sources */,
+				E1000001 /* DashboardView.swift in Sources */,
+				E1000002 /* MenuBarPanel.swift in Sources */,
+				E1000003 /* SettingsView.swift in Sources */,
+				E1000005 /* PulseDesign.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

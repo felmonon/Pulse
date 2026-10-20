@@ -62,7 +62,7 @@ struct MacMonitorWidget: Widget {
     var body: some WidgetConfiguration {
         StaticConfiguration(kind: kind, provider: MacMonitorProvider()) { entry in
             MacMonitorWidgetEntryView(entry: entry)
-                .containerBackground(.fill.tertiary, for: .widget)
+                .containerBackground(.background, for: .widget)
         }
         .contentMarginsDisabled()
         .configurationDisplayName("Pulse")

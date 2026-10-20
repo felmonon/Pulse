@@ -20,7 +20,11 @@ let package = Package(
                 "MacMonitorWidgetExtension.entitlements",
                 "WidgetViews.swift",
                 "DynamicIslandView.swift",
-                "DynamicIslandPanel.swift"
+                "DynamicIslandPanel.swift",
+                "DashboardView.swift",
+                "MenuBarPanel.swift",
+                "SettingsView.swift",
+                "PulseDesign.swift"
             ]
         ),
         .testTarget(name: "MacMonitorWidgetTests", dependencies: ["MacMonitorWidget"])

@@ -25,13 +25,15 @@ final class DynamicIslandMathTests: XCTestCase {
 
     // MARK: - Island frames
 
-    func testRestingFrameReservesVisibleShelfBelowNotch() {
+    func testRestingFrameHugsNotchWithCompactEars() {
         // Screen 1728pt wide (a 14" MacBook at default scaling), notch 32pt tall.
         let screen = CGRect(x: 0, y: 0, width: 1728, height: 1117)
         let frame = DynamicIslandMath.restingFrame(screen: screen, notchHeight: 32, notchWidth: 200)
 
-        XCTAssertEqual(frame.height, 32 + DynamicIslandMath.restingShelfHeight, accuracy: 0.01)
-        XCTAssertGreaterThan(frame.width, 200)
+        // Exactly notch-height so the island reads as part of the hardware.
+        XCTAssertEqual(frame.height, 32, accuracy: 0.01)
+        // One ear either side of the cutout.
+        XCTAssertEqual(frame.width, 200 + DynamicIslandMath.compactEarWidth * 2, accuracy: 0.01)
         // Horizontally centered: midX == screen midX
         XCTAssertEqual(frame.midX, screen.midX, accuracy: 0.01)
         // Top edge at the top of the screen (y in screen coords; AppKit origin
@@ -69,6 +71,25 @@ final class DynamicIslandMathTests: XCTestCase {
             DynamicIslandMath.restingWidth(notchWidth: DynamicIslandMath.fallbackNotchWidth),
             accuracy: 0.01
         )
+    }
+
+    func testExpandedWidthNeverDropsBelowMinimum() {
+        XCTAssertEqual(
+            DynamicIslandMath.expandedWidth(notchWidth: 10),
+            DynamicIslandMath.expandedMinimumWidth,
+            accuracy: 0.01
+        )
+        XCTAssertGreaterThan(
+            DynamicIslandMath.expandedWidth(notchWidth: 400),
+            DynamicIslandMath.expandedMinimumWidth
+        )
+    }
+
+    func testRestingFrameSanitizesNonFiniteNotchHeight() {
+        let screen = CGRect(x: 0, y: 0, width: 1728, height: 1117)
+        let frame = DynamicIslandMath.restingFrame(screen: screen, notchHeight: .nan, notchWidth: 200)
+        XCTAssertEqual(frame.height, 1, accuracy: 0.01)
+        XCTAssertEqual(frame.maxY, screen.maxY, accuracy: 0.01)
     }
 
     // MARK: - Fullscreen detection

@@ -175,7 +175,12 @@ reset_pulse_widget_cache() {
   for area in snapshots timelines placeholders; do
     cache_path="$CHRONO_ROOT/$area/$WIDGET_KIND"
     if [[ -d "$cache_path" ]]; then
-      /bin/rm -rf "$cache_path"
+      # The widget container is privacy-protected; a shell without App Data
+      # access can't clear it. The cache is only an optimization (chronod was
+      # restarted above and the build number changed), so warn and continue
+      # instead of aborting a half-finished install.
+      /bin/rm -rf "$cache_path" 2>/dev/null \
+        || printf 'warning: could not clear %s (no App Data access); continuing.\n' "$cache_path" >&2
     fi
   done
 }

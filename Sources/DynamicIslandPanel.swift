@@ -126,8 +126,11 @@ final class DynamicIslandPanel: NSPanel {
         guard let screen = DynamicIslandPanel.menuBarScreen else { return }
         let target = targetFrame(expanded: expanded, screen: screen.frame)
         NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0.32
-            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            // A fast-out, long-settle curve that reads like the iPhone's
+            // spring without overshooting the screen edge.
+            context.duration = expanded ? 0.42 : 0.34
+            context.timingFunction = CAMediaTimingFunction(controlPoints: 0.2, 0.9, 0.2, 1.0)
+            context.allowsImplicitAnimation = true
             self.animator().setFrame(target, display: true)
         }
     }

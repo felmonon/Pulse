@@ -294,4 +294,184 @@ final class SystemStatsMathTests: XCTestCase {
             "0.0 MB/s"
         )
     }
+
+    // MARK: - CPU breakdown
+
+    func testCPUBreakdownSplitsUserAndSystemPerCore() {
+        let previous = [
+            SystemStatsMath.CPUCoreTicks(user: 100, system: 50, idle: 850, nice: 0),
+            SystemStatsMath.CPUCoreTicks(user: 0, system: 0, idle: 1_000, nice: 0)
+        ]
+        let current = [
+            // +60 user, +20 system, +20 idle -> 80% busy
+            SystemStatsMath.CPUCoreTicks(user: 160, system: 70, idle: 870, nice: 0),
+            // +100 idle -> 0% busy
+            SystemStatsMath.CPUCoreTicks(user: 0, system: 0, idle: 1_100, nice: 0)
+        ]
+
+        let breakdown = SystemStatsMath.cpuBreakdown(previous: previous, current: current)
+
+        XCTAssertEqual(breakdown.cores.count, 2)
+        XCTAssertEqual(breakdown.cores[0], 0.8, accuracy: 0.0001)
+        XCTAssertEqual(breakdown.cores[1], 0, accuracy: 0.0001)
+        XCTAssertEqual(breakdown.user, 0.3, accuracy: 0.0001)
+        XCTAssertEqual(breakdown.system, 0.1, accuracy: 0.0001)
+        XCTAssertEqual(breakdown.total, 0.4, accuracy: 0.0001)
+    }
+
+    func testCPUBreakdownCountsNiceAsUserTime() {
+        let previous = [SystemStatsMath.CPUCoreTicks(user: 0, system: 0, idle: 0, nice: 0)]
+        let current = [SystemStatsMath.CPUCoreTicks(user: 10, system: 0, idle: 80, nice: 10)]
+
+        let breakdown = SystemStatsMath.cpuBreakdown(previous: previous, current: current)
+
+        XCTAssertEqual(breakdown.user, 0.2, accuracy: 0.0001)
+        XCTAssertEqual(breakdown.system, 0, accuracy: 0.0001)
+    }
+
+    func testCPUBreakdownFallsBackToCumulativeTicksWhenCoreCountChanges() {
+        let previous = [SystemStatsMath.CPUCoreTicks(user: 900, system: 0, idle: 100, nice: 0)]
+        let current = [
+            SystemStatsMath.CPUCoreTicks(user: 25, system: 25, idle: 50, nice: 0),
+            SystemStatsMath.CPUCoreTicks(user: 0, system: 0, idle: 100, nice: 0)
+        ]
+
+        let breakdown = SystemStatsMath.cpuBreakdown(previous: previous, current: current)
+
+        XCTAssertEqual(breakdown.cores, [0.5, 0])
+        XCTAssertEqual(breakdown.total, 0.25, accuracy: 0.0001)
+    }
+
+    func testCPUBreakdownWithNoTicksIsIdle() {
+        let breakdown = SystemStatsMath.cpuBreakdown(previous: nil, current: [])
+        XCTAssertEqual(breakdown.total, 0)
+        XCTAssertTrue(breakdown.cores.isEmpty)
+    }
+
+    // MARK: - Memory breakdown
+
+    func testMemoryBreakdownMatchesActivityMonitorDefinitions() {
+        let breakdown = SystemStatsMath.memoryBreakdown(
+            totalBytes: 1_000,
+            pageSize: 10,
+            internalPages: 40,
+            purgeablePages: 5,
+            externalPages: 15,
+            wiredPages: 20,
+            compressorPages: 10
+        )
+
+        XCTAssertEqual(breakdown.appBytes, 350, accuracy: 0.01)       // (40 - 5) * 10
+        XCTAssertEqual(breakdown.wiredBytes, 200, accuracy: 0.01)
+        XCTAssertEqual(breakdown.compressedBytes, 100, accuracy: 0.01)
+        XCTAssertEqual(breakdown.cachedBytes, 200, accuracy: 0.01)    // (15 + 5) * 10
+        XCTAssertEqual(breakdown.usedBytes, 650, accuracy: 0.01)      // app + wired + compressed
+        XCTAssertEqual(breakdown.usage, 0.65, accuracy: 0.0001)
+    }
+
+    func testMemoryBreakdownClampsToPhysicalMemory() {
+        let breakdown = SystemStatsMath.memoryBreakdown(
+            totalBytes: 100,
+            pageSize: 10,
+            internalPages: 50,
+            purgeablePages: 60,
+            externalPages: 50,
+            wiredPages: 20,
+            compressorPages: 0
+        )
+
+        XCTAssertEqual(breakdown.appBytes, 0, accuracy: 0.01)
+        XCTAssertEqual(breakdown.usedBytes, 100, accuracy: 0.01)
+        XCTAssertEqual(breakdown.cachedBytes, 0, accuracy: 0.01)
+        XCTAssertEqual(breakdown.usage, 1, accuracy: 0.0001)
+    }
+
+    func testMemoryBreakdownRejectsInvalidTotals() {
+        XCTAssertEqual(
+            SystemStatsMath.memoryBreakdown(
+                totalBytes: .nan,
+                pageSize: 16_384,
+                internalPages: 1,
+                purgeablePages: 0,
+                externalPages: 0,
+                wiredPages: 0,
+                compressorPages: 0
+            ),
+            .empty
+        )
+    }
+
+    // MARK: - Battery time
+
+    func testBatteryMinutesUsesTimeToFullWhileCharging() {
+        XCTAssertEqual(
+            SystemStatsMath.batteryMinutes(isCharging: true, isPluggedIn: true, timeToEmpty: 300, timeToFull: 42),
+            42
+        )
+    }
+
+    func testBatteryMinutesUsesTimeToEmptyOnBattery() {
+        XCTAssertEqual(
+            SystemStatsMath.batteryMinutes(isCharging: false, isPluggedIn: false, timeToEmpty: 185, timeToFull: nil),
+            185
+        )
+    }
+
+    func testBatteryMinutesHidesEstimatesThatAreStillCalculating() {
+        XCTAssertNil(SystemStatsMath.batteryMinutes(isCharging: true, isPluggedIn: true, timeToEmpty: nil, timeToFull: -1))
+        XCTAssertNil(SystemStatsMath.batteryMinutes(isCharging: false, isPluggedIn: false, timeToEmpty: -1, timeToFull: nil))
+        // Plugged in but not charging (e.g. held at 80%): no countdown.
+        XCTAssertNil(SystemStatsMath.batteryMinutes(isCharging: false, isPluggedIn: true, timeToEmpty: 200, timeToFull: nil))
+    }
+
+    // MARK: - History
+
+    func testHistoryKeepsMostRecentSamplesWithinCapacity() {
+        var history = MetricHistory(capacity: 3)
+        for value in [0.1, 0.2, 0.3, 0.4, 0.5] {
+            history.append(cpu: value, memory: value, networkUp: 0, networkDown: 0)
+        }
+
+        XCTAssertEqual(history.samples.count, 3)
+        XCTAssertEqual(history.samples.map(\.cpu), [0.3, 0.4, 0.5])
+        XCTAssertEqual(history.samples.map(\.id), [2, 3, 4])
+    }
+
+    func testHistorySanitizesSamples() {
+        var history = MetricHistory(capacity: 4)
+        history.append(cpu: .nan, memory: 1.7, networkUp: -5, networkDown: .infinity)
+
+        let sample = history.samples[0]
+        XCTAssertEqual(sample.cpu, 0)
+        XCTAssertEqual(sample.memory, 1)
+        XCTAssertEqual(sample.networkUp, 0)
+        XCTAssertEqual(sample.networkDown, 0)
+    }
+
+    func testHistoryNetworkCeilingHasAFloor() {
+        var history = MetricHistory()
+        XCTAssertEqual(history.networkCeiling, 64, accuracy: 0.01)
+        history.append(cpu: 0, memory: 0, networkUp: 100, networkDown: 1_000)
+        XCTAssertEqual(history.networkCeiling, 1_150, accuracy: 0.01)
+    }
+
+    // MARK: - Formatting
+
+    func testUptimeFormatting() {
+        XCTAssertEqual(PulseSharedSettings.formatUptime(0), "—")
+        XCTAssertEqual(PulseSharedSettings.formatUptime(8 * 60), "8m")
+        XCTAssertEqual(PulseSharedSettings.formatUptime(5 * 3600 + 12 * 60), "5h 12m")
+        XCTAssertEqual(PulseSharedSettings.formatUptime(3 * 86_400 + 4 * 3600 + 59), "3d 4h")
+    }
+
+    func testBatteryTimeFormatting() {
+        XCTAssertEqual(PulseSharedSettings.formatBatteryTime(minutes: 125), "2:05")
+        XCTAssertEqual(PulseSharedSettings.formatBatteryTime(minutes: -3), "0:00")
+    }
+
+    func testIntervalDescriptionReadsLikeSettings() {
+        XCTAssertEqual(PulseSharedSettings.intervalDescription(1), "Every second")
+        XCTAssertEqual(PulseSharedSettings.intervalDescription(15), "Every 15 seconds")
+        XCTAssertEqual(PulseSharedSettings.intervalDescription(60), "Every minute")
+    }
 }

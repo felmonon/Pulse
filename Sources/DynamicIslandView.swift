@@ -1,19 +1,72 @@
 import SwiftUI
+import Charts
+
+/// Transient, system-initiated states the island can show at rest, the way
+/// the iPhone shows a charging activity when power connects.
+enum IslandActivity: Equatable {
+    case charging
+}
 
 @MainActor
 final class DynamicIslandPresentation: ObservableObject {
     @Published var isExpanded = false
     @Published var notchHeight: CGFloat
+    @Published var activity: IslandActivity?
 
     init(notchHeight: CGFloat) {
         self.notchHeight = notchHeight
     }
 }
 
+// MARK: - Island Shape
+/// The silhouette of the MacBook notch: flush with the top of the screen,
+/// with small concave shoulders at the top corners and rounded bottom
+/// corners. Both radii animate so resting ↔ expanded morphs smoothly.
+struct IslandShape: Shape {
+    var topCornerRadius: CGFloat
+    var bottomCornerRadius: CGFloat
+
+    var animatableData: AnimatablePair<CGFloat, CGFloat> {
+        get { AnimatablePair(topCornerRadius, bottomCornerRadius) }
+        set {
+            topCornerRadius = newValue.first
+            bottomCornerRadius = newValue.second
+        }
+    }
+
+    func path(in rect: CGRect) -> Path {
+        let top = max(min(topCornerRadius, rect.width / 4, rect.height / 2), 0)
+        let bottom = max(min(bottomCornerRadius, rect.height - top, (rect.width - top * 2) / 2), 0)
+
+        var path = Path()
+        path.move(to: CGPoint(x: rect.minX, y: rect.minY))
+        path.addQuadCurve(
+            to: CGPoint(x: rect.minX + top, y: rect.minY + top),
+            control: CGPoint(x: rect.minX + top, y: rect.minY)
+        )
+        path.addLine(to: CGPoint(x: rect.minX + top, y: rect.maxY - bottom))
+        path.addQuadCurve(
+            to: CGPoint(x: rect.minX + top + bottom, y: rect.maxY),
+            control: CGPoint(x: rect.minX + top, y: rect.maxY)
+        )
+        path.addLine(to: CGPoint(x: rect.maxX - top - bottom, y: rect.maxY))
+        path.addQuadCurve(
+            to: CGPoint(x: rect.maxX - top, y: rect.maxY - bottom),
+            control: CGPoint(x: rect.maxX - top, y: rect.maxY)
+        )
+        path.addLine(to: CGPoint(x: rect.maxX - top, y: rect.minY + top))
+        path.addQuadCurve(
+            to: CGPoint(x: rect.maxX, y: rect.minY),
+            control: CGPoint(x: rect.maxX - top, y: rect.minY)
+        )
+        path.closeSubpath()
+        return path
+    }
+}
+
 // MARK: - Dynamic Island View
-/// Renders the Dynamic Island content: a compact resting pill (CPU%) that
-/// expands on click to the full system breakdown. All values come from the
-/// existing `PulseStatsController` model — this view introduces no new data.
+/// At rest the island is notch-height, with live content in the two ears
+/// beside the cutout. Click to grow it downward into a full summary.
 ///
 /// The controller is observed (not snapshotted) so the island updates live as
 /// stats refresh.
@@ -22,235 +75,261 @@ struct DynamicIslandView: View {
     @ObservedObject var presentation: DynamicIslandPresentation
     let onToggle: () -> Void
 
-    @AppStorage(PulseSharedSettings.Keys.unitsMode, store: PulseSharedSettings.defaults) private var unitsModeRaw = PulseSharedSettings.UnitsMode.automatic.rawValue
     @AppStorage(PulseSharedSettings.Keys.showBattery, store: PulseSharedSettings.defaults) private var showBattery = true
     @AppStorage(PulseSharedSettings.Keys.showDisk, store: PulseSharedSettings.defaults) private var showDisk = true
     @AppStorage(PulseSharedSettings.Keys.showNetwork, store: PulseSharedSettings.defaults) private var showNetwork = true
-    @AppStorage(PulseSharedSettings.Keys.showActiveApps, store: PulseSharedSettings.defaults) private var showActiveApps = true
 
     private var stats: SystemStats { statsController.stats }
     private var isExpanded: Bool { presentation.isExpanded }
+    private var kinds: [MetricKind] { MetricKind.visible(includesDisk: showDisk) }
 
     private var pressure: PressureSummary {
         PressureSummary.highest(for: stats, includesDisk: showDisk)
     }
 
-    private var unitsMode: PulseSharedSettings.UnitsMode {
-        PulseSharedSettings.UnitsMode(rawValue: unitsModeRaw) ?? .automatic
+    private var status: PulseStatus {
+        PulseStatus(stats: stats, includesDisk: showDisk)
+    }
+
+    private var shape: IslandShape {
+        IslandShape(
+            topCornerRadius: isExpanded ? 12 : 7,
+            bottomCornerRadius: isExpanded ? 32 : 12
+        )
     }
 
     var body: some View {
-        ZStack {
-            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                .fill(Color.black)
+        ZStack(alignment: .top) {
+            shape.fill(Color.black)
 
-            content
+            if isExpanded {
+                expandedContent
+                    .transition(
+                        .asymmetric(
+                            insertion: .opacity.combined(with: .scale(scale: 0.92, anchor: .top)).animation(.spring(response: 0.42, dampingFraction: 0.86).delay(0.06)),
+                            removal: .opacity.animation(.easeOut(duration: 0.12))
+                        )
+                    )
+            } else {
+                compactContent
+                    .transition(.opacity.animation(.easeInOut(duration: 0.18)))
+            }
         }
-        .onTapGesture(perform: onToggle)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-        .animation(.easeInOut(duration: 0.18), value: isExpanded)
+        .contentShape(shape)
+        .onTapGesture(perform: onToggle)
+        .animation(.spring(response: 0.42, dampingFraction: 0.84), value: isExpanded)
+        .environment(\.colorScheme, .dark)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(Text(accessibilityLabel))
         .accessibilityHint(Text("Click to \(isExpanded ? "collapse" : "expand")."))
         .accessibilityAddTraits(.isButton)
+        .accessibilityAction { onToggle() }
     }
 
-    private var cornerRadius: CGFloat { isExpanded ? 20 : 12 }
+    // MARK: Compact (resting)
 
-    private var content: some View {
-        VStack(spacing: 0) {
-            Color.clear
-                .frame(height: max(presentation.notchHeight, 1))
-                .allowsHitTesting(false)
+    private var compactContent: some View {
+        HStack(spacing: 0) {
+            leadingEar
+                .frame(width: DynamicIslandMath.compactEarWidth, alignment: .center)
+            Spacer(minLength: 0)
+            trailingEar
+                .frame(width: DynamicIslandMath.compactEarWidth, alignment: .center)
+        }
+        .padding(.horizontal, 4)
+        .frame(height: max(presentation.notchHeight, 1))
+        .id(presentation.activity)
+        .transition(.blurReplace)
+    }
 
-            if isExpanded {
-                expandedContent
-            } else {
-                restingContent
-            }
+    @ViewBuilder
+    private var leadingEar: some View {
+        switch presentation.activity {
+        case .charging:
+            Image(systemName: "bolt.fill")
+                .font(.system(size: 12, weight: .bold))
+                .foregroundStyle(.green)
+                .symbolEffect(.pulse, options: .repeating)
+        case nil:
+            ConcentricRings(stats: stats, kinds: kinds, lineWidth: 3.2, gap: 1)
+                .frame(width: ringSide, height: ringSide)
         }
     }
 
-    private var restingContent: some View {
-        HStack(spacing: 7) {
-            Image(systemName: pressure.severity >= .high ? "exclamationmark.triangle.fill" : "waveform.path.ecg")
-                .font(.system(size: 9, weight: .semibold))
-                .foregroundStyle(pressureColor)
-
-            Text("\(pressure.label) \(pressure.percentText)")
-                .font(.system(size: 11, weight: .semibold, design: .rounded))
-                .foregroundStyle(.white)
-                .monospacedDigit()
-
-            if pressure.severity >= .high {
-                Text(pressureStatus)
-                    .font(.system(size: 9, weight: .medium, design: .rounded))
-                    .foregroundStyle(pressureColor)
+    @ViewBuilder
+    private var trailingEar: some View {
+        switch presentation.activity {
+        case .charging:
+            HStack(spacing: 4) {
+                Text("\(stats.batteryLevel)%")
+                    .font(.system(size: 12, weight: .semibold, design: .rounded))
+                    .monospacedDigit()
+                    .foregroundStyle(.green)
+                Image(systemName: "battery.100percent.bolt")
+                    .font(.system(size: 12, weight: .medium))
+                    .symbolRenderingMode(.palette)
+                    .foregroundStyle(.green, .white.opacity(0.5))
             }
+        case nil:
+            HStack(spacing: 3) {
+                Image(systemName: pressure.severity >= .high ? "exclamationmark.triangle.fill" : pressure.kind.symbol)
+                    .font(.system(size: 9.5, weight: .semibold))
+                Text(pressure.percentText)
+                    .font(.system(size: 12, weight: .semibold, design: .rounded))
+                    .monospacedDigit()
+                    .contentTransition(.numericText(value: pressure.progress))
+            }
+            .foregroundStyle(PulsePalette.severityTint(pressure.severity, fallback: pressure.kind.tint))
+            .animation(.snappy, value: pressure.percentText)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .padding(.horizontal, 12)
     }
+
+    private var ringSide: CGFloat {
+        min(max(presentation.notchHeight - 14, 14), 22)
+    }
+
+    // MARK: Expanded
 
     private var expandedContent: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 7) {
-                Image(systemName: "waveform.path.ecg")
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(AppColors.ramBlue)
-
-                Text("Pulse")
-                    .font(.system(size: 12, weight: .semibold, design: .rounded))
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Label("Pulse", systemImage: "waveform.path.ecg")
+                    .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(.white)
-
-                Spacer(minLength: 8)
-
-                Text("\(pressure.label) \(pressure.percentText) \(pressureStatus)")
-                    .font(.system(size: 10, weight: .medium, design: .rounded))
-                    .foregroundStyle(pressureColor)
-                    .monospacedDigit()
+                Spacer()
+                Label(status.shortTitle, systemImage: status.symbol)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(status.tint)
             }
+            .labelStyle(.titleAndIcon)
+            .frame(height: max(presentation.notchHeight, 1))
+            .padding(.horizontal, 26)
 
-            Rectangle()
-                .fill(Color.white.opacity(0.12))
-                .frame(height: 1)
+            HStack(alignment: .center, spacing: 20) {
+                ConcentricRings(stats: stats, kinds: kinds, lineWidth: 11, gap: 2)
+                    .frame(width: 100, height: 100)
 
-            metricRow(icon: "cpu", label: "CPU", value: PulseSharedSettings.percent(stats.cpuUsage), color: AppColors.cpuGreen)
-            metricRow(icon: "memorychip", label: "RAM", value: ramValue, color: AppColors.ramBlue)
-
-            if showDisk {
-                metricRow(icon: "internaldrive", label: "Disk", value: diskValue, color: AppColors.diskAmber)
-            }
-
-            if showBattery {
-                metricRow(icon: batteryIcon, label: "Battery", value: batteryValue, color: batteryColor)
-            }
-
-            if showNetwork {
-                metricRow(icon: "network", label: "Network", value: networkValue, color: AppColors.networkBlue)
-            }
-
-            if showActiveApps, !stats.activeApps.isEmpty {
-                metricRow(
-                    icon: "macwindow.on.rectangle",
-                    label: "Apps",
-                    value: stats.activeApps.prefix(2).joined(separator: ", "),
-                    color: .white.opacity(0.72)
-                )
-            }
-
-            if stats.isStale {
-                HStack(spacing: 3) {
-                    Image(systemName: "clock.badge.exclamationmark")
-                        .font(.system(size: 9))
-                    Text("Stats need a refresh")
-                        .font(.system(size: 10))
+                VStack(alignment: .leading, spacing: 9) {
+                    ForEach(kinds) { kind in
+                        metricRow(kind)
+                    }
                 }
-                .foregroundStyle(AppColors.diskAmber)
             }
-        }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 12)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-    }
-
-    private func metricRow(icon: String, label: String, value: String, color: Color) -> some View {
-        HStack(spacing: 6) {
-            Image(systemName: icon)
-                .font(.system(size: 10, weight: .medium))
-                .foregroundStyle(color)
-                .frame(width: 13)
-
-            Text(label)
-                .font(.system(size: 10, weight: .regular))
-                .foregroundStyle(.white.opacity(0.62))
+            .padding(.horizontal, 26)
+            .padding(.top, 8)
 
             Spacer(minLength: 8)
 
-            Text(value)
-                .font(.system(size: 10, weight: .medium, design: .rounded))
-                .foregroundStyle(.white)
+            HStack(spacing: 14) {
+                if showNetwork {
+                    NetworkRates(up: stats.networkUp, down: stats.networkDown, fontSize: 11)
+                }
+                Spacer(minLength: 0)
+                if showBattery {
+                    HStack(spacing: 6) {
+                        Text(BatteryStatusText.describe(stats))
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(.white.opacity(0.6))
+                        BatteryGlyph(
+                            level: stats.batteryLevel,
+                            isCharging: stats.isCharging,
+                            hasBattery: stats.hasBattery
+                        )
+                    }
+                }
+            }
+            .padding(.horizontal, 26)
+            .padding(.bottom, 16)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    private func metricRow(_ kind: MetricKind) -> some View {
+        let severity = kind.severity(in: stats)
+        return HStack(spacing: 10) {
+            Text(kind.title)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(.white.opacity(0.62))
+                .frame(width: 58, alignment: .leading)
+
+            Text(PulseSharedSettings.percent(kind.value(in: stats)))
+                .font(.system(size: 15, weight: .semibold, design: .rounded))
                 .monospacedDigit()
-                .lineLimit(1)
-                .minimumScaleFactor(0.7)
+                .contentTransition(.numericText(value: kind.value(in: stats)))
+                .foregroundStyle(PulsePalette.severityTint(severity, fallback: kind.tint))
+                .frame(width: 46, alignment: .trailing)
+
+            Group {
+                switch kind {
+                case .cpu:
+                    IslandSparkline(values: statsController.history.samples.map(\.cpu), tint: kind.tint, capacity: statsController.history.capacity)
+                case .memory:
+                    IslandSparkline(values: statsController.history.samples.map(\.memory), tint: kind.tint, capacity: statsController.history.capacity)
+                case .disk:
+                    Text("\(PulseSharedSettings.formatGigabytes(stats.diskAvailable)) free")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.55))
+                }
+            }
+            .frame(width: 150, height: 16, alignment: .leading)
         }
+        .animation(.snappy, value: kind.value(in: stats))
     }
 
-    // MARK: - Formatted values (reuse existing PulseSharedSettings helpers)
-
-    private var ramValue: String {
-        "\(PulseSharedSettings.percent(stats.memoryUsage)) · \(PulseSharedSettings.formatGigabytes(stats.memoryUsed))"
-    }
-
-    private var diskValue: String {
-        "\(PulseSharedSettings.formatGigabytes(stats.diskAvailable)) free"
-    }
-
-    private var batteryValue: String {
-        guard stats.hasBattery else { return "AC" }
-        return "\(stats.batteryLevel)%\(stats.isCharging ? " charging" : "")"
-    }
-
-    private var batteryIcon: String {
-        guard stats.hasBattery else { return "powerplug" }
-        return stats.isCharging ? "battery.100.bolt" : "battery.100"
-    }
-
-    private var batteryColor: Color {
-        guard stats.hasBattery else { return .secondary }
-        if stats.batteryLevel <= 20 { return AppColors.critical }
-        if stats.batteryLevel < 50 { return AppColors.diskAmber }
-        return AppColors.batteryGreen
-    }
-
-    private var networkValue: String {
-        "Down \(PulseSharedSettings.formatSpeed(stats.networkDown, unitsMode: unitsMode))  Up \(PulseSharedSettings.formatSpeed(stats.networkUp, unitsMode: unitsMode))"
-    }
-
-    private var pressureColor: Color {
-        switch pressure.severity {
-        case .nominal:
-            return AppColors.cpuGreen
-        case .moderate:
-            return pressure.color
-        case .high:
-            return AppColors.diskAmber
-        case .critical:
-            return AppColors.critical
-        }
-    }
-
-    private var pressureStatus: String {
-        switch pressure.severity {
-        case .nominal:
-            return "OK"
-        case .moderate:
-            return "Normal"
-        case .high:
-            return "High"
-        case .critical:
-            return "Critical"
-        }
-    }
+    // MARK: Accessibility
 
     private var accessibilityLabel: String {
-        isExpanded
+        if presentation.activity == .charging {
+            return "Pulse island. Charging, \(stats.batteryLevel) percent."
+        }
+        return isExpanded
             ? "Pulse island expanded. \(expandedContentSummary)"
-            : "Pulse island. \(pressure.label) \(pressure.percentText), \(pressureStatus)."
+            : "Pulse island. \(pressure.label) \(pressure.percentText), \(pressure.severity.title)."
     }
 
     private var expandedContentSummary: String {
-        var values = [
-            "CPU \(PulseSharedSettings.percent(stats.cpuUsage))",
-            "RAM \(PulseSharedSettings.percent(stats.memoryUsage))"
-        ]
-        if showDisk { values.append("disk \(diskValue)") }
-        if showBattery { values.append("battery \(batteryValue)") }
-        if showNetwork { values.append("network \(networkValue)") }
-        if showActiveApps, !stats.activeApps.isEmpty {
-            values.append("active apps \(stats.activeApps.prefix(2).joined(separator: ", "))")
-        }
+        var values = kinds.map { "\($0.title) \(PulseSharedSettings.percent($0.value(in: stats)))" }
+        if showBattery { values.append("battery \(stats.batteryLevel) percent, \(BatteryStatusText.describe(stats))") }
         if stats.isStale { values.append("stats need a refresh") }
         return values.joined(separator: ", ") + "."
+    }
+}
+
+// MARK: - Island Sparkline
+/// A minimal history line for the dark island; fills from the right so new
+/// samples always land at the trailing edge.
+struct IslandSparkline: View {
+    let values: [Double]
+    let tint: Color
+    let capacity: Int
+
+    var body: some View {
+        Chart {
+            ForEach(Array(values.enumerated()), id: \.offset) { index, value in
+                AreaMark(
+                    x: .value("Sample", index + capacity - values.count),
+                    y: .value("Usage", value)
+                )
+                .foregroundStyle(
+                    LinearGradient(colors: [tint.opacity(0.45), tint.opacity(0)], startPoint: .top, endPoint: .bottom)
+                )
+                .interpolationMethod(.monotone)
+
+                LineMark(
+                    x: .value("Sample", index + capacity - values.count),
+                    y: .value("Usage", value)
+                )
+                .foregroundStyle(tint)
+                .lineStyle(StrokeStyle(lineWidth: 1.4, lineCap: .round, lineJoin: .round))
+                .interpolationMethod(.monotone)
+            }
+        }
+        .chartXScale(domain: 0...max(capacity - 1, 1))
+        .chartYScale(domain: 0...1)
+        .chartXAxis(.hidden)
+        .chartYAxis(.hidden)
+        .chartLegend(.hidden)
+        .accessibilityHidden(true)
     }
 }
