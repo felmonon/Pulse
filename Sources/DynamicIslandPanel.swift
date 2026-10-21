@@ -127,8 +127,10 @@ final class DynamicIslandPanel: NSPanel {
         let target = targetFrame(expanded: expanded, screen: screen.frame)
         NSAnimationContext.runAnimationGroup { context in
             // A fast-out, long-settle curve that reads like the iPhone's
-            // spring without overshooting the screen edge.
-            context.duration = expanded ? 0.42 : 0.34
+            // spring without overshooting the screen edge. With Reduce Motion
+            // the island changes size almost instantly.
+            let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+            context.duration = reduceMotion ? 0.1 : (expanded ? 0.42 : 0.34)
             context.timingFunction = CAMediaTimingFunction(controlPoints: 0.2, 0.9, 0.2, 1.0)
             context.allowsImplicitAnimation = true
             self.animator().setFrame(target, display: true)

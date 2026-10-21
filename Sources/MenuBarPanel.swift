@@ -1,10 +1,11 @@
 import SwiftUI
-import Charts
 import AppKit
 
 // MARK: - Menu Bar Panel
-/// The menu-bar window, laid out like a Control Center module stack: status
-/// up top, rings and live history, compact tiles, then actions.
+/// The menu-bar window, modeled on the system Battery and Wi-Fi menus: a
+/// header with the status sentence, a few plain rows of live values, then
+/// menu-style actions. No tiles, no per-metric color: every bar is the accent
+/// until its value is genuinely high, and every number stays primary.
 struct MenuBarPanel: View {
     @EnvironmentObject private var statsController: PulseStatsController
     @Environment(\.openWindow) private var openWindow
@@ -14,288 +15,235 @@ struct MenuBarPanel: View {
     @AppStorage(PulseSettings.Keys.showDisk, store: PulseSettings.defaults) private var showDisk = true
     @AppStorage(PulseSettings.Keys.showNetwork, store: PulseSettings.defaults) private var showNetwork = true
     @AppStorage(PulseSettings.Keys.islandEnabled, store: PulseSettings.defaults) private var islandEnabled = false
+    @AppStorage(PulseSettings.Keys.unitsMode, store: PulseSettings.defaults) private var unitsModeRaw = PulseSettings.UnitsMode.automatic.rawValue
 
     private var stats: SystemStats { statsController.stats }
-    private var kinds: [MetricKind] { MetricKind.visible(includesDisk: showDisk) }
-    private var status: PulseStatus { PulseStatus(stats: stats, includesDisk: showDisk) }
+    private var status: PulseStatus {
+        PulseStatus(stats: stats, includesDisk: showDisk, includesBattery: showBattery)
+    }
+    private var unitsMode: PulseSettings.UnitsMode { PulseSettings.UnitsMode(rawValue: unitsModeRaw) ?? .automatic }
+    private var showsBatteryRow: Bool { showBattery && stats.hasBattery }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 0) {
             header
-                .padding(.horizontal, 4)
+                .padding(.horizontal, PanelLayout.edge)
+                .padding(.top, 12)
+                .padding(.bottom, 10)
 
-            ringsModule
+            PanelSeparator()
 
-            historyModule
-
-            if showNetwork || showBattery {
-                HStack(spacing: 10) {
-                    if showNetwork { networkTile }
-                    if showBattery { powerTile }
+            VStack(alignment: .leading, spacing: PanelLayout.rowSpacing) {
+                ForEach(MetricKind.visible(includesDisk: showDisk)) { kind in
+                    metricRow(kind)
                 }
-                .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(.horizontal, PanelLayout.edge)
+            .padding(.vertical, PanelLayout.sectionPadding)
+
+            if showNetwork || showsBatteryRow {
+                PanelSeparator()
+
+                VStack(alignment: .leading, spacing: 8) {
+                    if showNetwork { networkRow }
+                    if showsBatteryRow { batteryRow }
+                }
+                .padding(.horizontal, PanelLayout.edge)
+                .padding(.vertical, PanelLayout.sectionPadding)
             }
 
             if DynamicIslandPanel.notchIsPresent {
-                islandToggle
+                PanelSeparator()
+                islandRow
+                    .padding(.horizontal, PanelLayout.edge)
+                    .padding(.vertical, 6)
             }
 
-            Divider()
-                .padding(.horizontal, 4)
+            PanelSeparator()
 
-            VStack(spacing: 1) {
-                PanelActionRow(title: "Open Pulse", symbol: "macwindow") {
+            VStack(alignment: .leading, spacing: 0) {
+                PanelMenuItem(title: "Open Pulse") {
                     NSApp.activate()
                     openWindow(id: PulseSettings.mainWindowID)
                 }
-                PanelActionRow(title: "Activity Monitor", symbol: "chart.bar.xaxis") {
+                PanelMenuItem(title: "Open Activity Monitor") {
                     PulseActions.openActivityMonitor()
                 }
-                PanelActionRow(title: "Settings…", symbol: "gearshape") {
+                PanelMenuItem(title: "Settings…") {
                     NSApp.activate()
                     openSettings()
                 }
-                PanelActionRow(title: "Quit Pulse", symbol: "power") {
+                PanelSeparator()
+                PanelMenuItem(title: "Quit Pulse") {
                     NSApplication.shared.terminate(nil)
                 }
             }
+            .padding(.bottom, PanelLayout.itemInset)
         }
-        .padding(12)
-        .frame(width: 320)
+        .frame(width: PanelLayout.width)
     }
 
     // MARK: Header
 
     private var header: some View {
-        HStack(alignment: .center, spacing: 10) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Pulse")
-                    .font(.system(size: 13, weight: .bold))
-                Label(status.headline, systemImage: status.symbol)
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(status.severity >= .high || status.isHot ? status.tint : .secondary)
-                    .labelStyle(.titleAndIcon)
-                    .lineLimit(1)
-            }
-
-            Spacer(minLength: 8)
-
-            Button {
-                statsController.refresh(reloadWidgets: true)
-            } label: {
-                Image(systemName: "arrow.clockwise")
-                    .font(.system(size: 12, weight: .semibold))
-                    .frame(width: 26, height: 26)
-                    .background(Color.primary.opacity(0.08), in: Circle())
-            }
-            .buttonStyle(.plain)
-            .help("Refresh Now")
-            .accessibilityLabel(Text("Refresh Now"))
+        VStack(alignment: .leading, spacing: 3) {
+            Text("Pulse")
+                .font(.headline)
+            // Names every condition in words (headline + detail), so the
+            // orange and red bars below never carry a warning alone. Callout
+            // matches StatusLine's detail line, so the two sentences read as
+            // one paragraph rather than a smaller headline over larger text.
+            StatusLine(status: status, font: .callout, showsDetail: true)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 
-    // MARK: Modules
+    // MARK: Metrics
 
-    private var ringsModule: some View {
-        HStack(spacing: 16) {
-            ConcentricRings(stats: stats, kinds: kinds, lineWidth: 9.5, gap: 1.5)
-                .frame(width: 80, height: 80)
-                .animation(.spring(response: 0.6, dampingFraction: 0.85), value: stats.cpuUsage)
+    /// CPU, Memory and Storage share one rhythm: title and percent, then a
+    /// thin bar. Severity colors the bar; the number stays primary.
+    private func metricRow(_ kind: MetricKind) -> some View {
+        let value = kind.value(in: stats)
+        let severity = kind.severity(in: stats)
 
-            VStack(alignment: .leading, spacing: 6) {
-                ForEach(kinds) { kind in
-                    let severity = kind.severity(in: stats)
-                    HStack(spacing: 6) {
-                        Circle()
-                            .fill(kind.ring.start)
-                            .frame(width: 7, height: 7)
-                        Text(kind.title)
-                            .foregroundStyle(.secondary)
-                        Spacer(minLength: 6)
-                        if severity >= .high {
-                            Image(systemName: "exclamationmark.triangle.fill")
-                                .font(.system(size: 10))
-                                .foregroundStyle(PulsePalette.severityTint(severity, fallback: kind.tint))
-                        }
-                        Text(PulseSharedSettings.percent(kind.value(in: stats)))
-                            .font(.system(size: 13, weight: .semibold, design: .rounded))
-                            .monospacedDigit()
-                            .contentTransition(.numericText(value: kind.value(in: stats)))
-                            .foregroundStyle(PulsePalette.severityTint(severity, fallback: .primary))
-                    }
-                    .font(.system(size: 12, weight: .medium))
-                    .accessibilityElement(children: .combine)
+        return VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(kind.title)
+                Spacer(minLength: 8)
+                // Memory's bar shows occupancy, so its pressure is said in
+                // words beside the value rather than by coloring the bar.
+                if kind == .memory, severity >= .high, let tint = PulseStyle.textTint(for: severity) {
+                    Text(severity >= .critical ? "Critical pressure" : "High pressure")
+                        .font(.callout)
+                        .foregroundStyle(tint)
                 }
+                ValueText(PulseFormat.percent(value), size: .compact, numeric: value)
             }
-            .animation(.snappy, value: stats.timestamp)
+            UsageBar(value: value, tint: PulseStyle.markTint(for: kind.markSeverity(in: stats)), height: 3)
         }
-        .moduleStyle()
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(Text(kind.title))
+        .accessibilityValue(Text(accessibilityValue(kind, percent: value, severity: severity)))
     }
 
-    private var historyModule: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack {
-                Text("Activity")
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(.secondary)
-                Spacer()
-                LegendItem(title: "CPU", color: PulsePalette.cpu)
-                LegendItem(title: "Memory", color: PulsePalette.memory)
-            }
-
-            UsageHistoryChart(history: statsController.history, showsAxis: false)
-                .frame(height: 52)
-        }
-        .moduleStyle()
+    private func accessibilityValue(_ kind: MetricKind, percent value: Double, severity: LoadSeverity) -> String {
+        let percent = PulseFormat.percentText(value)
+        return severity >= .high ? "\(percent), \(kind.spokenSeverity(severity))" : percent
     }
 
-    private var networkTile: some View {
-        VStack(alignment: .leading, spacing: 5) {
-            Label("Network", systemImage: "network")
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(.secondary)
-            NetworkRateStack(up: stats.networkUp, down: stats.networkDown)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .moduleStyle()
-    }
+    // MARK: Network and Battery
 
-    private var powerTile: some View {
-        VStack(alignment: .leading, spacing: 5) {
-            Label(stats.hasBattery ? "Battery" : "Power", systemImage: stats.hasBattery ? "battery.75percent" : "powerplug")
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(.secondary)
-            HStack(alignment: .firstTextBaseline, spacing: 4) {
-                Text(stats.hasBattery ? "\(stats.batteryLevel)%" : "AC")
-                    .font(.system(size: 17, weight: .semibold, design: .rounded))
-                    .monospacedDigit()
-                    .foregroundStyle(PulsePalette.batteryTint(level: stats.batteryLevel, isCharging: stats.isCharging, hasBattery: stats.hasBattery))
-                if stats.isCharging {
-                    Image(systemName: "bolt.fill")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.green)
-                }
-            }
-            Text(stats.hasBattery ? BatteryStatusText.describe(stats) : "Up \(PulseSharedSettings.formatUptime(stats.uptime))")
-                .font(.system(size: 11))
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .moduleStyle()
-    }
-
-    private var islandToggle: some View {
-        HStack(spacing: 10) {
-            Image(systemName: "capsule.tophalf.filled")
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(islandEnabled ? .white : .secondary)
-                .frame(width: 26, height: 26)
-                .background(islandEnabled ? Color.accentColor : Color.primary.opacity(0.08), in: Circle())
-
-            VStack(alignment: .leading, spacing: 1) {
-                Text("Notch Island")
-                    .font(.system(size: 12, weight: .medium))
-                Text("Live stats around the notch")
-                    .font(.system(size: 10.5))
-                    .foregroundStyle(.secondary)
-            }
-
+    private var networkRow: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 12) {
+            Text("Network")
             Spacer(minLength: 8)
+            rate(symbol: "arrow.down", value: stats.networkDown)
+            rate(symbol: "arrow.up", value: stats.networkUp)
+        }
+        .lineLimit(1)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(Text("Network"))
+        .accessibilityValue(Text("Download \(speedText(stats.networkDown)), upload \(speedText(stats.networkUp))"))
+    }
 
+    private func rate(symbol: String, value: Double) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 3) {
+            Image(systemName: symbol)
+                .font(.caption.weight(.medium))
+                .foregroundStyle(.secondary)
+            ValueText(PulseFormat.speed(value, unitsMode: unitsMode), size: .compact, numeric: value)
+        }
+    }
+
+    private func speedText(_ value: Double) -> String {
+        let parts = PulseFormat.speed(value, unitsMode: unitsMode)
+        return parts.unit.isEmpty ? parts.number : "\(parts.number) \(parts.unit)"
+    }
+
+    /// Battery-menu phrasing: "3:23 remaining  82%". A low battery is named by
+    /// the status line above, so the number stays primary here too.
+    private var batteryRow: some View {
+        let level = stats.batteryLevel
+        let detail = BatteryStatusText.describe(stats)
+
+        return HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text("Battery")
+            Spacer(minLength: 8)
+            Text(detail)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            ValueText(("\(level)", "%"), size: .compact, numeric: Double(level))
+        }
+        .lineLimit(1)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(Text("Battery"))
+        .accessibilityValue(Text("\(level) percent, \(detail)"))
+    }
+
+    // MARK: Notch Island
+
+    private var islandRow: some View {
+        HStack {
+            Text("Notch Island")
+                .accessibilityHidden(true)
+            Spacer(minLength: 8)
             Toggle("Notch Island", isOn: $islandEnabled)
                 .labelsHidden()
                 .toggleStyle(.switch)
-                .controlSize(.small)
+                .controlSize(.mini)
         }
-        .moduleStyle(padding: 8)
         .onChange(of: islandEnabled) { _, _ in
             NotificationCenter.default.post(name: .pulseIslandSettingChanged, object: nil)
         }
     }
 }
 
-// MARK: - Network Rate Stack
-struct NetworkRateStack: View {
-    let up: Double
-    let down: Double
-    @AppStorage(PulseSharedSettings.Keys.unitsMode, store: PulseSharedSettings.defaults) private var unitsModeRaw = PulseSharedSettings.UnitsMode.automatic.rawValue
+// MARK: - Layout
+private enum PanelLayout {
+    static let width: CGFloat = 300
+    /// Leading edge of every label, shared by info rows and menu items.
+    static let edge: CGFloat = 14
+    /// Inset of the menu-item highlight from the panel edge.
+    static let itemInset: CGFloat = 5
+    static let itemHeight: CGFloat = 24
+    static let sectionPadding: CGFloat = 10
+    static let rowSpacing: CGFloat = 12
+}
 
-    private var unitsMode: PulseSharedSettings.UnitsMode {
-        PulseSharedSettings.UnitsMode(rawValue: unitsModeRaw) ?? .automatic
-    }
-
+// MARK: - Separator
+/// A menu separator: a hairline aligned to the label column.
+private struct PanelSeparator: View {
     var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            row(symbol: "arrow.down.circle.fill", value: down, tint: PulsePalette.networkDown)
-            row(symbol: "arrow.up.circle.fill", value: up, tint: PulsePalette.networkUp)
-        }
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel(Text("Download \(PulseSharedSettings.formatSpeed(down, unitsMode: unitsMode)), upload \(PulseSharedSettings.formatSpeed(up, unitsMode: unitsMode))"))
-    }
-
-    private func row(symbol: String, value: Double, tint: Color) -> some View {
-        HStack(spacing: 5) {
-            Image(systemName: symbol)
-                .symbolRenderingMode(.hierarchical)
-                .foregroundStyle(tint)
-                .font(.system(size: 12))
-            Text(PulseSharedSettings.formatSpeed(value, unitsMode: unitsMode))
-                .font(.system(size: 13, weight: .semibold, design: .rounded))
-                .monospacedDigit()
-                .lineLimit(1)
-                .minimumScaleFactor(0.8)
-        }
+        Divider()
+            .padding(.horizontal, PanelLayout.edge)
+            .padding(.vertical, 5)
     }
 }
 
-// MARK: - Panel Action Row
-/// A menu-style row with the system hover highlight.
-struct PanelActionRow: View {
+// MARK: - Menu Item
+/// A row that behaves like an NSMenu item: full width, text only, accent
+/// highlight with white text while the pointer is over it.
+private struct PanelMenuItem: View {
     let title: String
-    let symbol: String
     let action: () -> Void
 
-    @State private var isHovering = false
+    @State private var isHighlighted = false
 
     var body: some View {
         Button(action: action) {
-            HStack(spacing: 8) {
-                Image(systemName: symbol)
-                    .font(.system(size: 12, weight: .medium))
-                    .frame(width: 18)
-                    .foregroundStyle(isHovering ? .white : .secondary)
-                Text(title)
-                    .font(.system(size: 13))
-                    .foregroundStyle(isHovering ? .white : .primary)
-                Spacer()
-            }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 5)
-            .background(
-                RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .fill(isHovering ? Color.accentColor : Color.clear)
-            )
-            .contentShape(Rectangle())
+            Text(title)
+                .foregroundStyle(isHighlighted ? Color.white : Color.primary)
+                .lineLimit(1)
+                .frame(maxWidth: .infinity, minHeight: PanelLayout.itemHeight, alignment: .leading)
+                .padding(.horizontal, PanelLayout.edge - PanelLayout.itemInset)
+                .background(
+                    RoundedRectangle(cornerRadius: 5, style: .continuous)
+                        .fill(isHighlighted ? Color.accentColor : Color.clear)
+                )
+                .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .onHover { isHovering = $0 }
-    }
-}
-
-// MARK: - Module Style
-extension View {
-    /// The rounded, softly filled tile used for Control Center–style modules.
-    func moduleStyle(padding: CGFloat = 12) -> some View {
-        self
-            .padding(padding)
-            .background(
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .fill(Color.primary.opacity(0.055))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .strokeBorder(Color.primary.opacity(0.06), lineWidth: 0.5)
-            )
+        .padding(.horizontal, PanelLayout.itemInset)
+        .onHover { isHighlighted = $0 }
     }
 }

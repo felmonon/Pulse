@@ -18,20 +18,26 @@ struct MacMonitorProvider: TimelineProvider {
     }
 
     func getSnapshot(in context: Context, completion: @escaping (MacMonitorEntry) -> Void) {
-        let entry = MacMonitorEntry(date: Date(), stats: currentStats())
-        completion(entry)
+        // The gallery preview needs an answer immediately.
+        if context.isPreview {
+            completion(MacMonitorEntry(date: Date(), stats: currentStats()))
+            return
+        }
+        SystemMonitor.shared.freshStats { stats in
+            completion(MacMonitorEntry(date: Date(), stats: stats))
+        }
     }
 
     func getTimeline(in context: Context, completion: @escaping (Timeline<MacMonitorEntry>) -> Void) {
-        let currentDate = Date()
-        let stats = currentStats()
-        let entry = MacMonitorEntry(date: currentDate, stats: stats)
-
-        // Refresh every 15 seconds (fastest reliable rate for widgets)
-        let nextUpdate = Calendar.current.date(byAdding: .second, value: 15, to: currentDate)!
-        let timeline = Timeline(entries: [entry], policy: .after(nextUpdate))
-
-        completion(timeline)
+        // The extension wakes cold or with a minutes-old baseline; measure a
+        // fresh half-second so CPU and network match the menu bar.
+        SystemMonitor.shared.freshStats { stats in
+            let currentDate = Date()
+            let entry = MacMonitorEntry(date: currentDate, stats: stats)
+            // Refresh every 15 seconds (fastest reliable rate for widgets)
+            let nextUpdate = Calendar.current.date(byAdding: .second, value: 15, to: currentDate)!
+            completion(Timeline(entries: [entry], policy: .after(nextUpdate)))
+        }
     }
 }
 

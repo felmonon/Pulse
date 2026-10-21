@@ -15,6 +15,7 @@
 		A1000006 /* WidgetViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000002; };
 		A1000007 /* SystemStats.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000003; };
 		A1000008 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A2000004; };
+		F1000001 /* AppIcon.icon in Resources */ = {isa = PBXBuildFile; fileRef = F2000001; };
 		D1000010 /* DynamicIslandView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D2000010; };
 		D1000011 /* DynamicIslandPanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = D2000011; };
 		E1000001 /* DashboardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E2000001; };
@@ -57,6 +58,7 @@
 		A2000002 /* WidgetViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WidgetViews.swift; sourceTree = "<group>"; };
 		A2000003 /* SystemStats.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SystemStats.swift; sourceTree = "<group>"; };
 		A2000004 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		F2000001 /* AppIcon.icon */ = {isa = PBXFileReference; lastKnownFileType = folder.iconcomposer.icon; path = AppIcon.icon; sourceTree = "<group>"; };
 		A2000005 /* MacMonitorApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MacMonitorApp.swift; sourceTree = "<group>"; };
 		D2000010 /* DynamicIslandView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DynamicIslandView.swift; sourceTree = "<group>"; };
 		D2000011 /* DynamicIslandPanel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DynamicIslandPanel.swift; sourceTree = "<group>"; };
@@ -103,6 +105,7 @@
 				A2000002 /* WidgetViews.swift */,
 				A2000003 /* SystemStats.swift */,
 				A2000004 /* Assets.xcassets */,
+				F2000001 /* AppIcon.icon */,
 				A2000005 /* MacMonitorApp.swift */,
 				D2000010 /* DynamicIslandView.swift */,
 				D2000011 /* DynamicIslandPanel.swift */,
@@ -237,6 +240,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				A1000008 /* Assets.xcassets in Resources */,
+				F1000001 /* AppIcon.icon in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

@@ -22,7 +22,7 @@ struct MacMonitorApp: App {
             DashboardView()
                 .environmentObject(statsController)
         }
-        .defaultSize(width: 980, height: 800)
+        .defaultSize(width: 980, height: 700)
         .windowToolbarStyle(.unified)
         .commands {
             PulseCommands(statsController: statsController)
@@ -130,20 +130,53 @@ final class PulseStatsController: ObservableObject {
     private var lastWidgetTimelineReload = Date.distantPast
     private let widgetTimelineReloadInterval: TimeInterval = 15
 
+    // Hysteresis so a color or sentence changes only on a sustained state.
+    // Raise after 3 samples; clear after 8 (CPU) or 12 (memory pressure).
+    private var cpuLatch = SystemStatsMath.SeverityLatch(enterSamples: 3, exitSamples: 8)
+    private var memoryLatch = SystemStatsMath.SeverityLatch(enterSamples: 3, exitSamples: 12)
+    private var diskLatch = SystemStatsMath.SeverityLatch(enterSamples: 2, exitSamples: 4)
+
     init() {
         stats = .placeholder
         configureTimer(interval: refreshInterval)
+        // The first reading has no baseline (since-boot CPU, zero network):
+        // show it briefly, then take a real one half a second later.
         refresh(reloadWidgets: true)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            self?.refresh(reloadWidgets: true)
+        }
+    }
+
+    /// A static controller for previews and headless renders: no timer, no
+    /// sampling, populated history.
+    private init(previewStats: SystemStats, history: MetricHistory) {
+        stats = previewStats
+        self.history = history
+    }
+
+    static func preview(_ stats: SystemStats = .placeholder) -> PulseStatsController {
+        PulseStatsController(previewStats: stats, history: .preview())
     }
 
     deinit {
         timer?.invalidate()
     }
 
-    func refresh(reloadWidgets: Bool = false) {
-        let sample = SystemMonitor.shared.getStats()
+    /// Samples the system. Timer ticks record history; a manual refresh
+    /// (`recordsHistory: false`) updates the readings without adding an
+    /// off-cadence point to the charts.
+    func refresh(reloadWidgets: Bool = false, recordsHistory: Bool = true) {
+        var sample = SystemMonitor.shared.getStats()
+        if sample.isWarmSample {
+            sample.latchedCPUSeverity = cpuLatch.update(sample.rawCPUSeverity)
+            sample.latchedMemorySeverity = memoryLatch.update(sample.rawMemorySeverity)
+            sample.latchedDiskSeverity = diskLatch.update(sample.rawDiskSeverity)
+        }
         stats = sample
-        history.append(sample)
+        // A cold first reading is never charted.
+        if recordsHistory, sample.isWarmSample {
+            history.append(sample)
+        }
         reloadWidgetTimelineIfNeeded(force: reloadWidgets)
     }
 
@@ -154,6 +187,9 @@ final class PulseStatsController: ObservableObject {
         }
 
         refreshInterval = clampedInterval
+        // The charts plot by sample; a new cadence would silently change the
+        // time span, so start the history over.
+        history.removeAll()
         configureTimer(interval: clampedInterval)
     }
 
@@ -245,13 +281,13 @@ final class DynamicIslandController: ObservableObject {
         guard enabled, statsController.stats.hasBattery, panel != nil, !isExpanded else { return }
 
         activityTask?.cancel()
-        withAnimation(.spring(response: 0.45, dampingFraction: 0.78)) {
+        withAnimation(.smooth(duration: 0.4)) {
             presentation.activity = .charging
         }
         activityTask = Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 4_000_000_000)
             guard !Task.isCancelled, let self else { return }
-            withAnimation(.spring(response: 0.5, dampingFraction: 0.85)) {
+            withAnimation(.smooth(duration: 0.45)) {
                 self.presentation.activity = nil
             }
         }
@@ -376,7 +412,7 @@ struct PulseCommands: Commands {
     var body: some Commands {
         CommandGroup(before: .toolbar) {
             Button("Refresh Now") {
-                statsController.refresh(reloadWidgets: true)
+                statsController.refresh(reloadWidgets: true, recordsHistory: false)
             }
             .keyboardShortcut("r")
 
@@ -388,47 +424,53 @@ struct PulseCommands: Commands {
 // MARK: - Menu Bar Label
 struct PulseMenuBarLabel: View {
     @ObservedObject var statsController: PulseStatsController
-    @AppStorage(PulseSettings.Keys.showDisk, store: PulseSettings.defaults) private var showDisk = true
     @AppStorage(PulseSettings.Keys.menuBarStyle, store: PulseSettings.defaults) private var menuBarStyleRaw = PulseSharedSettings.MenuBarStyle.busiest.rawValue
 
     private var stats: SystemStats {
         statsController.stats
     }
 
-    private var pressure: PressureSummary {
-        PressureSummary.highest(for: stats, includesDisk: showDisk)
+    /// Only the live metrics feature in the menu bar: a full disk is said
+    /// inside the panel, not pinned to the menu bar for days.
+    private var featured: PressureSummary {
+        PressureSummary.ambient(for: stats)
     }
 
     private var style: PulseSharedSettings.MenuBarStyle {
         PulseSharedSettings.MenuBarStyle(rawValue: menuBarStyleRaw) ?? .busiest
     }
 
-    private var symbol: String {
-        pressure.severity >= .high ? "exclamationmark.triangle.fill" : "waveform.path.ecg"
+    /// The same open gauge as the app icon and the notch island's ear, as a
+    /// template image so it inverts with the menu bar.
+    private var glyph: Image {
+        Image("MenuBarGauge")
+    }
+
+    private var text: String? {
+        switch style {
+        case .iconOnly:
+            return nil
+        case .busiest:
+            return "\(featured.label) \(featured.percentText)"
+        case .cpuAndMemory:
+            return "CPU \(PulseSettings.percent(stats.cpuUsage))  Memory \(PulseSettings.percent(stats.memoryUsage))"
+        }
     }
 
     var body: some View {
         Group {
-            switch style {
-            case .iconOnly:
-                Image(systemName: symbol)
-            case .busiest:
+            if let text {
                 Label {
-                    Text("\(pressure.label) \(pressure.percentText)")
+                    Text(text)
                         .monospacedDigit()
                 } icon: {
-                    Image(systemName: symbol)
+                    glyph
                 }
-            case .cpuAndMemory:
-                Label {
-                    Text("CPU \(PulseSettings.percent(stats.cpuUsage))  RAM \(PulseSettings.percent(stats.memoryUsage))")
-                        .monospacedDigit()
-                } icon: {
-                    Image(systemName: symbol)
-                }
+            } else {
+                glyph
             }
         }
-        .accessibilityLabel(Text("Pulse, \(pressure.label) \(pressure.percentText), \(pressure.severity.accessibilityDescription)"))
+        .accessibilityLabel(Text(text.map { "Pulse, \($0)" } ?? "Pulse"))
     }
 }
 

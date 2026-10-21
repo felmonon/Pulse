@@ -1,896 +1,1147 @@
 import SwiftUI
 import Charts
 import AppKit
-import WidgetKit
 
-// MARK: - Surfaces
-/// Grouped-content colors in the style of Health and Fitness: a soft page
-/// with raised cards, tuned separately for light and dark appearances.
-enum PulseSurface {
-    static let page = Color(nsColor: NSColor(name: "PulsePage") { appearance in
-        appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-            ? NSColor(srgbRed: 0.075, green: 0.075, blue: 0.08, alpha: 1)
-            : NSColor(srgbRed: 0.949, green: 0.949, blue: 0.965, alpha: 1)
-    })
-
-    static let card = Color(nsColor: NSColor(name: "PulseCard") { appearance in
-        appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-            ? NSColor(srgbRed: 0.137, green: 0.137, blue: 0.149, alpha: 1)
-            : NSColor.white
-    })
-}
-
-// MARK: - Dashboard
+// MARK: - Main Window
+/// Pulse's main window: a source-list sidebar and quiet, System Settings–style
+/// detail panes. Monochrome chrome, one accent for data; severity colors a
+/// value's mark, never its number (see docs/design/pulse-design-language.md).
 struct DashboardView: View {
     @EnvironmentObject private var statsController: PulseStatsController
-    @Environment(\.openSettings) private var openSettings
 
-    @AppStorage(PulseSettings.Keys.showBattery, store: PulseSettings.defaults) private var showBattery = true
+    /// Persisted in the standard defaults so the window reopens where it was
+    /// left; also accepts `-pulse.selectedSection <page>` at launch.
+    @AppStorage("pulse.selectedSection") private var selection: Page = .overview
+    @AppStorage(PulseSettings.Keys.unitsMode, store: PulseSettings.defaults)
+    private var unitsModeRaw = PulseSharedSettings.UnitsMode.automatic.rawValue
     @AppStorage(PulseSettings.Keys.showDisk, store: PulseSettings.defaults) private var showDisk = true
     @AppStorage(PulseSettings.Keys.showNetwork, store: PulseSettings.defaults) private var showNetwork = true
+    @AppStorage(PulseSettings.Keys.showBattery, store: PulseSettings.defaults) private var showBattery = true
+
+    private var visibility: Visibility {
+        Visibility(
+            storage: showDisk,
+            network: showNetwork,
+            battery: showBattery && statsController.stats.hasBattery
+        )
+    }
+
+    private var context: PageContext {
+        PageContext(
+            stats: statsController.stats,
+            history: statsController.history,
+            unitsMode: PulseSharedSettings.UnitsMode(rawValue: unitsModeRaw) ?? .automatic,
+            sampleInterval: statsController.refreshInterval,
+            visibility: visibility
+        )
+    }
+
+    private var pages: [Page] {
+        Page.allCases.filter { visibility.shows($0) }
+    }
+
+    /// The selection, falling back to Overview when the stored page is hidden
+    /// in Settings or not available on this Mac (e.g. Battery on a desktop).
+    private var page: Page {
+        pages.contains(selection) ? selection : .overview
+    }
+
+    private var sidebarSelection: Binding<Page?> {
+        Binding(
+            get: { page },
+            set: { newValue in
+                if let newValue { selection = newValue }
+            }
+        )
+    }
+
+    var body: some View {
+        let context = context
+
+        NavigationSplitView {
+            List(selection: sidebarSelection) {
+                ForEach(pages) { item in
+                    SidebarRow(page: item)
+                        .tag(item)
+                }
+            }
+            .listStyle(.sidebar)
+            .navigationSplitViewColumnWidth(min: 200, ideal: 220, max: 260)
+        } detail: {
+            PageView(page: page, context: context) { selection = $0 }
+                .navigationTitle(page.title)
+                .toolbar {
+                    ToolbarItem(placement: .primaryAction) {
+                        Button {
+                            PulseActions.openActivityMonitor()
+                        } label: {
+                            Label("Activity Monitor", systemImage: "arrow.up.forward.app")
+                        }
+                        .help("Open Activity Monitor")
+                    }
+                }
+        }
+        .frame(minWidth: 760, minHeight: 540)
+        .onChange(of: pages) { _, available in
+            // A page hidden in Settings should not stay selected behind the scenes.
+            if !available.contains(selection) { selection = .overview }
+        }
+    }
+}
+
+// MARK: - Pages
+private enum Page: String, CaseIterable, Identifiable {
+    case overview, cpu, memory, storage, network, battery
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .overview: return "Overview"
+        case .cpu: return "CPU"
+        case .memory: return "Memory"
+        case .storage: return "Storage"
+        case .network: return "Network"
+        case .battery: return "Battery"
+        }
+    }
+
+    func symbol(for stats: SystemStats) -> String {
+        switch self {
+        case .overview: return "square.grid.2x2"
+        case .cpu: return "cpu"
+        case .memory: return "memorychip"
+        case .storage: return "internaldrive"
+        case .network: return "network"
+        case .battery: return BatteryStatusText.symbol(stats)
+        }
+    }
+}
+
+/// Which optional metrics the person chose to show (Settings › Metrics).
+private struct Visibility: Equatable {
+    let storage: Bool
+    let network: Bool
+    let battery: Bool
+
+    func shows(_ page: Page) -> Bool {
+        switch page {
+        case .overview, .cpu, .memory: return true
+        case .storage: return storage
+        case .network: return network
+        case .battery: return battery
+        }
+    }
+}
+
+/// Everything a page needs to draw one frame.
+private struct PageContext {
+    let stats: SystemStats
+    let history: MetricHistory
+    let unitsMode: PulseSharedSettings.UnitsMode
+    let sampleInterval: TimeInterval
+    let visibility: Visibility
+
+    var status: PulseStatus {
+        PulseStatus(stats: stats, includesDisk: visibility.storage, includesBattery: visibility.battery)
+    }
+
+    /// "Last 90 seconds": the span every history chart covers.
+    var windowCaption: String {
+        let total = Int((Double(history.capacity) * sampleInterval).rounded())
+        if total < 120 { return "Last \(total) seconds" }
+        let minutes = Int((Double(total) / 60).rounded())
+        if minutes < 120 { return "Last \(minutes) minutes" }
+        return "Last \(minutes / 60) hours"
+    }
+
+    func speed(_ value: Double) -> String {
+        PulseSharedSettings.formatSpeed(value, unitsMode: unitsMode)
+    }
+
+    func speedParts(_ value: Double) -> (number: String, unit: String) {
+        PulseFormat.speed(value, unitsMode: unitsMode)
+    }
+}
+
+private struct PageView: View {
+    let page: Page
+    let context: PageContext
+    let select: (Page) -> Void
+
+    var body: some View {
+        switch page {
+        case .overview: OverviewPage(context: context, select: select)
+        case .cpu: CPUPage(context: context)
+        case .memory: MemoryPage(context: context)
+        case .storage: StoragePage(context: context)
+        case .network: NetworkPage(context: context)
+        case .battery: BatteryPage(context: context)
+        }
+    }
+}
+
+// MARK: - Sidebar
+/// A source-list row with its current figure trailing, like a Mail count.
+/// The title never truncates: it keeps its full width, and the figure gives
+/// way instead (the network arrow is dropped first). Each row observes the
+/// controller itself so the figure never lags the detail pane (sidebar cells
+/// are not always rebuilt with their parent).
+private struct SidebarRow: View {
+    @EnvironmentObject private var statsController: PulseStatsController
+
+    let page: Page
 
     private var stats: SystemStats { statsController.stats }
 
-    private enum Card: String, Identifiable {
-        case cpu, memory, network, storage, battery, system
-        var id: String { rawValue }
-    }
-
-    private var cards: [Card] {
-        var cards: [Card] = [.cpu, .memory]
-        if showNetwork { cards.append(.network) }
-        if showDisk { cards.append(.storage) }
-        if showBattery && stats.hasBattery { cards.append(.battery) }
-        cards.append(.system)
-        return cards
-    }
-
-    private var cardRows: [[Card]] {
-        stride(from: 0, to: cards.count, by: 2).map { Array(cards[$0..<min($0 + 2, cards.count)]) }
-    }
-
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 28) {
-                OverviewHero(stats: stats, refreshInterval: statsController.refreshInterval)
-
-                Grid(horizontalSpacing: 16, verticalSpacing: 16) {
-                    ForEach(cardRows, id: \.first) { row in
-                        GridRow {
-                            ForEach(row) { card in
-                                cardView(card)
-                                    .gridCellColumns(row.count == 1 ? 2 : 1)
-                            }
-                        }
-                    }
-                }
-
-                WidgetGallery(stats: stats)
-            }
-            .padding(.horizontal, 28)
-            .padding(.top, 20)
-            .padding(.bottom, 32)
-            .frame(maxWidth: 1080)
-            .frame(maxWidth: .infinity)
+        HStack(spacing: 0) {
+            Label(page.title, systemImage: page.symbol(for: stats))
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
+                .layoutPriority(1)
+            Spacer(minLength: 10)
+            value
+                .foregroundStyle(.secondary)
+                .monospacedDigit()
+                .lineLimit(1)
         }
-        .scrollIndicators(.automatic)
-        .background(PulseSurface.page.ignoresSafeArea())
-        .navigationTitle("Pulse")
-        .navigationSubtitle(subtitle)
-        .toolbar {
-            ToolbarItemGroup(placement: .primaryAction) {
-                Button {
-                    statsController.refresh(reloadWidgets: true)
-                } label: {
-                    Label("Refresh", systemImage: "arrow.clockwise")
-                }
-                .help("Refresh Now (⌘R)")
-
-                Button {
-                    PulseActions.openActivityMonitor()
-                } label: {
-                    Label("Activity Monitor", systemImage: "chart.bar.xaxis")
-                }
-                .help("Open Activity Monitor")
-
-                Button {
-                    openSettings()
-                } label: {
-                    Label("Settings", systemImage: "gearshape")
-                }
-                .help("Pulse Settings (⌘,)")
-            }
-        }
-        .frame(minWidth: 720, minHeight: 560)
-        .onAppear {
-            statsController.refresh()
-        }
-    }
-
-    private var subtitle: String {
-        stats.isStale ? "Waiting for fresh stats" : "Live · \(PulseSharedSettings.intervalDescription(statsController.refreshInterval).lowercased())"
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(Text(page.title))
+        .accessibilityValue(Text(accessibilityValue))
     }
 
     @ViewBuilder
-    private func cardView(_ card: Card) -> some View {
-        switch card {
-        case .cpu: CPUCard(stats: stats, history: statsController.history)
-        case .memory: MemoryCard(stats: stats, history: statsController.history)
-        case .network: NetworkCard(stats: stats, history: statsController.history)
-        case .storage: StorageCard(stats: stats)
-        case .battery: BatteryCard(stats: stats)
-        case .system: SystemCard(stats: stats)
+    private var value: some View {
+        switch page {
+        case .overview:
+            EmptyView()
+        case .cpu:
+            Text(PulseFormat.percentText(stats.cpuUsage))
+        case .memory:
+            Text(PulseFormat.percentText(stats.memoryUsage))
+        case .storage:
+            Text(PulseFormat.percentText(stats.diskUsage))
+        case .network:
+            let rate = PulseFormat.dominantRate(down: stats.networkDown, up: stats.networkUp)
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 3) {
+                    Image(systemName: rate.symbol)
+                        .imageScale(.small)
+                    Text(speed(rate.value))
+                }
+                Text(speed(rate.value))
+            }
+        case .battery:
+            Text("\(stats.batteryLevel)%")
+        }
+    }
+
+    /// Always the automatic unit, whatever the Network speed setting: the
+    /// figure is then never wider than "999 KB/s" or "9.9 MB/s". The unit
+    /// preference applies to the Overview and the Network page.
+    private func speed(_ value: Double) -> String {
+        let parts = PulseFormat.speed(value, unitsMode: .automatic)
+        return "\(parts.number) \(parts.unit)"
+    }
+
+    private var accessibilityValue: String {
+        switch page {
+        case .overview: return ""
+        case .cpu: return PulseFormat.percentText(stats.cpuUsage)
+        case .memory: return "\(PulseFormat.percentText(stats.memoryUsage)) used"
+        case .storage: return "\(PulseFormat.percentText(stats.diskUsage)) full"
+        case .network:
+            let rate = PulseFormat.dominantRate(down: stats.networkDown, up: stats.networkUp)
+            return "\(rate.isDownload ? "Download" : "Upload") \(speed(rate.value))"
+        case .battery: return "\(stats.batteryLevel)%"
         }
     }
 }
 
-// MARK: - Overview Hero
-struct OverviewHero: View {
-    let stats: SystemStats
-    let refreshInterval: TimeInterval
-    @AppStorage(PulseSettings.Keys.showDisk, store: PulseSettings.defaults) private var showDisk = true
+// MARK: - Overview
+/// Status in words, then the five metrics: CPU and Memory large with their
+/// history, Storage, Network and Battery smaller beneath. Hidden metrics
+/// leave no holes; the remaining tiles share the row.
+private struct OverviewPage: View {
+    let context: PageContext
+    let select: (Page) -> Void
 
-    private var kinds: [MetricKind] { MetricKind.visible(includesDisk: showDisk) }
-    private var status: PulseStatus { PulseStatus(stats: stats, includesDisk: showDisk) }
+    private let spacing: CGFloat = 16
+    /// The history marks in the first row: this tall at rest, and at most
+    /// `OverviewStack.maxGrowth` taller in a tall window.
+    private let historyMarkHeight: CGFloat = 64
 
-    var body: some View {
-        ViewThatFits(in: .horizontal) {
-            layout(showsGlance: true)
-            layout(showsGlance: false)
-        }
-        .padding(28)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .cardBackground()
-    }
+    private var stats: SystemStats { context.stats }
+    private var history: MetricHistory { context.history }
+    private var visibility: Visibility { context.visibility }
 
-    private func layout(showsGlance: Bool) -> some View {
-        HStack(alignment: .center, spacing: 0) {
-            ConcentricRings(stats: stats, kinds: kinds, lineWidth: 21, gap: 3)
-                .frame(width: 172, height: 172)
-                .padding(.trailing, 32)
-                .animation(.spring(response: 0.7, dampingFraction: 0.85), value: stats.timestamp)
-
-            VStack(alignment: .leading, spacing: 18) {
-                VStack(alignment: .leading, spacing: 5) {
-                    Label {
-                        Text(status.headline)
-                    } icon: {
-                        Image(systemName: status.symbol)
-                            .symbolRenderingMode(.hierarchical)
-                            .foregroundStyle(status.tint)
-                    }
-                    .font(.system(size: 24, weight: .bold))
-                    .contentTransition(.opacity)
-                    .animation(.easeInOut(duration: 0.25), value: status.headline)
-
-                    Text("\(MachineInfo.chipName) · \(MachineInfo.osVersion) · Up \(PulseSharedSettings.formatUptime(stats.uptime))")
-                        .font(.system(size: 13))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
-
-                HStack(alignment: .top, spacing: 26) {
-                    ForEach(kinds) { kind in
-                        HeroStat(kind: kind, stats: stats)
-                    }
-                }
-            }
-            .fixedSize()
-
-            Spacer(minLength: showsGlance ? 24 : 0)
-
-            if showsGlance {
-                Divider()
-                    .frame(height: 140)
-                    .padding(.trailing, 24)
-                GlanceColumn(stats: stats)
-                    .frame(width: 190, alignment: .leading)
-            }
-        }
-    }
-}
-
-/// Battery, network and temperature at a glance, beside the rings.
-struct GlanceColumn: View {
-    let stats: SystemStats
-    @AppStorage(PulseSettings.Keys.showBattery, store: PulseSettings.defaults) private var showBattery = true
-    @AppStorage(PulseSettings.Keys.showNetwork, store: PulseSettings.defaults) private var showNetwork = true
-    @AppStorage(PulseSettings.Keys.unitsMode, store: PulseSettings.defaults) private var unitsModeRaw = PulseSettings.UnitsMode.automatic.rawValue
-
-    private var unitsMode: PulseSettings.UnitsMode {
-        PulseSettings.UnitsMode(rawValue: unitsModeRaw) ?? .automatic
+    private var machineCaption: String {
+        [MachineInfo.chipName, MachineInfo.osVersion, "Up \(PulseFormat.uptime(stats.uptime))"]
+            .joined(separator: " · ")
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            if showBattery && stats.hasBattery {
-                row(
-                    symbol: stats.isCharging ? "bolt.fill" : "battery.75percent",
-                    tint: .green,
-                    title: "Battery",
-                    value: "\(stats.batteryLevel)%",
-                    detail: BatteryStatusText.describe(stats)
-                )
+        GeometryReader { viewport in
+            ScrollView {
+                content(fillHeight: viewport.size.height - PulseStyle.pagePadding * 2)
+                    .padding(PulseStyle.pagePadding)
             }
-            if showNetwork {
-                row(
-                    symbol: "arrow.up.arrow.down",
-                    tint: PulsePalette.networkDown,
-                    title: "Network",
-                    value: "↓ \(PulseSharedSettings.formatSpeed(stats.networkDown, unitsMode: unitsMode))",
-                    detail: "↑ \(PulseSharedSettings.formatSpeed(stats.networkUp, unitsMode: unitsMode))"
-                )
+        }
+    }
+
+    /// The page without its scroll view, growing toward `fillHeight`.
+    func content(fillHeight: CGFloat) -> some View {
+        OverviewStack(gaps: [28, spacing], fillHeight: fillHeight) {
+            VStack(alignment: .leading, spacing: 0) {
+                StatusLine(status: context.status, showsDetail: true)
+                Text(machineCaption)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .padding(.top, 10)
             }
-            row(
-                symbol: "thermometer.medium",
-                tint: stats.thermalLevel.tint,
-                title: "Temperature",
-                value: stats.thermalLevel.title,
-                detail: nil
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            HStack(alignment: .top, spacing: spacing) {
+                cpuTile
+                memoryTile
+            }
+
+            if visibility.storage || visibility.network || visibility.battery {
+                HStack(alignment: .top, spacing: spacing) {
+                    if visibility.storage { storageTile }
+                    if visibility.network { networkTile }
+                    if visibility.battery { batteryTile }
+                }
+            }
+        }
+    }
+
+    // Row 1 — history at a readable size.
+
+    private var cpuTile: some View {
+        let detail = "User \(PulseFormat.percentText(stats.cpuUser)) · System \(PulseFormat.percentText(stats.cpuSystem))"
+        return OverviewTile(
+            title: "CPU",
+            detail: Text(detail),
+            accessibilityValue: spoken(PulseFormat.percentText(stats.cpuUsage), detail, alert(.cpu)),
+            markHeight: historyMarkHeight,
+            growsMark: true,
+            action: { select(.cpu) }
+        ) {
+            ValueText(PulseFormat.percent(stats.cpuUsage), size: .tile, numeric: stats.cpuUsage)
+        } mark: {
+            sparkline(history.samples.map(\.cpu), kind: .cpu, title: "CPU history")
+        }
+    }
+
+    private var memoryTile: some View {
+        let detail = "\(PulseFormat.gigabytesText(stats.memoryUsed)) of \(PulseFormat.capacityText(stats.memoryTotal))"
+        return OverviewTile(
+            title: "Memory",
+            detail: Text(detail),
+            accessibilityValue: spoken(PulseFormat.percentText(stats.memoryUsage), detail, alert(.memory)),
+            markHeight: historyMarkHeight,
+            growsMark: true,
+            action: { select(.memory) }
+        ) {
+            ValueText(PulseFormat.percent(stats.memoryUsage), size: .tile, numeric: stats.memoryUsage)
+        } mark: {
+            sparkline(history.samples.map(\.memory), kind: .memory, title: "Memory history")
+        }
+    }
+
+    // Row 2 — one short mark each, bottoms aligned.
+
+    private var storageTile: some View {
+        let detail = "\(PulseFormat.gigabytesText(stats.diskAvailable)) available"
+        return OverviewTile(
+            title: "Storage",
+            detail: Text(detail),
+            accessibilityValue: spoken("\(PulseFormat.percentText(stats.diskUsage)) full", detail, alert(.disk)),
+            markHeight: 32,
+            action: { select(.storage) }
+        ) {
+            ValueText(PulseFormat.percent(stats.diskUsage), size: .tile, numeric: stats.diskUsage)
+        } mark: {
+            UsageBar(
+                value: stats.diskUsage,
+                tint: PulseStyle.markTint(for: MetricKind.disk.markSeverity(in: stats)),
+                height: 6
             )
         }
     }
 
-    private func row(symbol: String, tint: Color, title: String, value: String, detail: String?) -> some View {
-        HStack(spacing: 11) {
-            Image(systemName: symbol)
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(tint)
-                .frame(width: 30, height: 30)
-                .background(tint.opacity(0.15), in: Circle())
-
-            VStack(alignment: .leading, spacing: 1) {
-                Text(title)
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(.secondary)
-                HStack(alignment: .firstTextBaseline, spacing: 6) {
-                    Text(value)
-                        .font(.system(size: 14, weight: .semibold, design: .rounded))
-                        .monospacedDigit()
-                    if let detail {
-                        Text(detail)
-                            .font(.system(size: 12))
-                            .foregroundStyle(.secondary)
-                            .monospacedDigit()
-                    }
-                }
-                .lineLimit(1)
-            }
+    private var networkTile: some View {
+        let rate = PulseFormat.dominantRate(down: stats.networkDown, up: stats.networkUp)
+        // The hero shows the busier direction; the detail only the other one.
+        let other = rate.isDownload
+            ? (symbol: "arrow.up", value: stats.networkUp, name: "upload")
+            : (symbol: "arrow.down", value: stats.networkDown, name: "download")
+        return OverviewTile(
+            title: "Network",
+            detail: Text(Image(systemName: other.symbol)) + Text(" \(context.speed(other.value)) \(other.name)"),
+            accessibilityValue: "Download \(context.speed(stats.networkDown)), upload \(context.speed(stats.networkUp))",
+            markHeight: 32,
+            action: { select(.network) }
+        ) {
+            DirectionalValue(symbol: rate.symbol, parts: context.speedParts(rate.value), numeric: rate.value)
+        } mark: {
+            sparkline(
+                history.samples.map(\.networkDown),
+                secondary: history.samples.map(\.networkUp),
+                upperBound: history.networkCeiling,
+                title: "Network history"
+            )
         }
-        .accessibilityElement(children: .combine)
+    }
+
+    private var batteryTile: some View {
+        let detail = BatteryStatusText.describe(stats)
+        let isLow = BatteryStatusText.severity(stats) >= .high
+        return OverviewTile(
+            title: "Battery",
+            detail: Text(detail),
+            accessibilityValue: spoken("\(stats.batteryLevel)%", detail, isLow ? "battery low" : nil),
+            markHeight: 32,
+            action: { select(.battery) }
+        ) {
+            ValueText(("\(stats.batteryLevel)", "%"), size: .tile, numeric: Double(stats.batteryLevel))
+        } mark: {
+            UsageBar(value: Double(stats.batteryLevel) / 100, tint: PulseStyle.batteryMarkTint(stats), height: 6)
+        }
+    }
+
+    /// A tile's history: the line is always the accent, and only the point on
+    /// the latest sample takes the metric's current severity, so the past is
+    /// never repainted. Until there are enough samples to read as a line, the
+    /// tile shows just its baseline and a faint midline.
+    private func sparkline(
+        _ values: [Double],
+        kind: MetricKind? = nil,
+        secondary: [Double]? = nil,
+        upperBound: Double = 1,
+        title: String
+    ) -> LineHistoryChart {
+        LineHistoryChart(
+            values: values,
+            capacity: history.capacity,
+            secondaryValues: secondary,
+            upperBound: upperBound,
+            accessibilityTitle: title,
+            latestTint: kind.map { PulseStyle.markTint(for: $0.markSeverity(in: stats)) },
+            hidesYoungHistory: true,
+            showsMidline: true
+        )
+    }
+
+    /// Spoken when a metric needs attention, so VoiceOver hears what the
+    /// status sentence and the mark's color say.
+    private func alert(_ kind: MetricKind) -> String? {
+        let severity = kind.severity(in: stats)
+        return severity >= .high ? kind.spokenSeverity(severity) : nil
+    }
+
+    private func spoken(_ parts: String?...) -> String {
+        parts.compactMap { $0 }.joined(separator: ", ")
     }
 }
 
-struct HeroStat: View {
-    let kind: MetricKind
-    let stats: SystemStats
+/// Stacks the Overview's header and tile rows. When the window is taller than
+/// the content, the first tile row (CPU and Memory) takes up to `maxGrowth`
+/// of the slack, so their history grows to a readable height (about 120pt)
+/// without turning into a tall, empty plot; any remaining slack stays below
+/// the tiles. When the window is shorter, the page scrolls at natural size.
+/// Each row is proposed one height, so the tiles in a row always match.
+private struct OverviewStack: Layout {
+    var gaps: [CGFloat]
+    var fillHeight: CGFloat
+    var growingRow = 1
+    var maxGrowth: CGFloat = 56
 
-    private var severity: LoadSeverity { kind.severity(in: stats) }
+    private func gap(after index: Int) -> CGFloat {
+        gaps.indices.contains(index) ? gaps[index] : gaps.last ?? 0
+    }
+
+    private func rowHeights(width: CGFloat?, subviews: Subviews) -> [CGFloat] {
+        var heights = subviews.map { $0.sizeThatFits(ProposedViewSize(width: width, height: nil)).height }
+        let gapsTotal = (0..<max(subviews.count - 1, 0)).reduce(0) { $0 + gap(after: $1) }
+        let natural = heights.reduce(0, +) + gapsTotal
+        if heights.indices.contains(growingRow), fillHeight > natural {
+            heights[growingRow] += min(fillHeight - natural, maxGrowth)
+        }
+        return heights
+    }
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let heights = rowHeights(width: proposal.width, subviews: subviews)
+        let width = proposal.width ?? subviews.map { $0.sizeThatFits(.unspecified).width }.max() ?? 0
+        let gapsTotal = (0..<max(subviews.count - 1, 0)).reduce(0) { $0 + gap(after: $1) }
+        return CGSize(width: width, height: heights.reduce(0, +) + gapsTotal)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        let heights = rowHeights(width: bounds.width, subviews: subviews)
+        var y = bounds.minY
+        for (index, subview) in subviews.enumerated() {
+            subview.place(
+                at: CGPoint(x: bounds.minX, y: y),
+                anchor: .topLeading,
+                proposal: ProposedViewSize(width: bounds.width, height: heights[index])
+            )
+            y += heights[index] + gap(after: index)
+        }
+    }
+}
+
+/// A quiet, clickable summary: label, number, one line of detail and a mark
+/// pinned to the bottom so every tile in a row lines up.
+private struct OverviewTile<Number: View, Mark: View>: View {
+    let title: String
+    let detail: Text
+    let accessibilityValue: String
+    /// The mark's height, or its minimum when it grows to fill the window.
+    let markHeight: CGFloat
+    var growsMark = false
+    let action: () -> Void
+    @ViewBuilder let number: () -> Number
+    @ViewBuilder let mark: () -> Mark
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(kind.title)
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(kind.tint)
-
-            HStack(alignment: .firstTextBaseline, spacing: 1) {
-                Text("\(Int((SystemStatsMath.unitInterval(kind.value(in: stats)) * 100).rounded()))")
-                    .font(.system(size: 36, weight: .semibold, design: .rounded))
-                    .contentTransition(.numericText(value: kind.value(in: stats)))
-                Text("%")
-                    .font(.system(size: 20, weight: .semibold, design: .rounded))
+        Button(action: action) {
+            VStack(alignment: .leading, spacing: 0) {
+                Text(title)
+                    .font(.subheadline)
                     .foregroundStyle(.secondary)
-            }
-            .monospacedDigit()
-            .foregroundStyle(PulsePalette.severityTint(severity, fallback: .primary))
-            .animation(.snappy, value: kind.value(in: stats))
 
-            Text(MetricDetail.short(kind, stats: stats))
-                .font(.system(size: 12))
-                .foregroundStyle(.secondary)
+                number()
+                    .padding(.top, 6)
+
+                detail
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .padding(.top, 2)
+
+                Spacer(minLength: 16)
+
+                mark()
+                    .frame(
+                        minHeight: markHeight,
+                        idealHeight: markHeight,
+                        maxHeight: growsMark ? .infinity : markHeight,
+                        alignment: .bottom
+                    )
+                    .frame(maxWidth: .infinity, alignment: .bottom)
+                    .layoutPriority(1)
+            }
+            .padding(16)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
+        .buttonStyle(TileButtonStyle())
+        // The sidebar already offers the same navigation by keyboard; keeping
+        // tiles out of the key loop stops the first tile grabbing focus (and
+        // a focus ring) at launch. VoiceOver can still activate them.
+        .focusable(false)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(Text(title))
+        .accessibilityValue(Text(accessibilityValue))
+        .accessibilityHint(Text("Shows \(title) details"))
+        .accessibilityAddTraits(.isButton)
+    }
+}
+
+private struct TileButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        TileChrome(configuration: configuration)
+    }
+
+    private struct TileChrome: View {
+        let configuration: ButtonStyleConfiguration
+        @State private var isHovered = false
+
+        private var fill: Color {
+            if configuration.isPressed { return Color.primary.opacity(0.08) }
+            if isHovered { return Color.primary.opacity(0.055) }
+            return PulseStyle.tileFill
+        }
+
+        var body: some View {
+            configuration.label
+                .background(fill, in: RoundedRectangle(cornerRadius: PulseStyle.cornerRadius, style: .continuous))
+                .contentShape(RoundedRectangle(cornerRadius: PulseStyle.cornerRadius, style: .continuous))
+                .onHover { isHovered = $0 }
+                .animation(.easeOut(duration: 0.15), value: isHovered)
+                .animation(.easeOut(duration: 0.1), value: configuration.isPressed)
+        }
+    }
+}
+
+// MARK: - Shared Page Parts
+/// The large light number and one secondary line that open every detail pane.
+/// The hero keeps proportional digits, so pages apply `.monospacedDigit()` to
+/// their live rows only, never to the whole form.
+private struct PageHeader: View {
+    let value: (number: String, unit: String)
+    let numeric: Double
+    let caption: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            ValueText(value, size: .hero, numeric: numeric)
+            Text(caption)
+                .font(.title3)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+        }
+        .textCase(nil)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.bottom, 10)
         .accessibilityElement(children: .combine)
     }
 }
 
-// MARK: - Card Chrome
-struct DashboardCard<Accessory: View, Content: View>: View {
-    let title: String
+/// The busier network direction: a secondary arrow, then the speed.
+private struct DirectionalValue: View {
     let symbol: String
-    let tint: Color
-    @ViewBuilder var accessory: () -> Accessory
-    @ViewBuilder var content: () -> Content
+    let parts: (number: String, unit: String)
+    var size: ValueText.Size = .tile
+    let numeric: Double
+
+    private var arrowFont: Font {
+        switch size {
+        case .hero: return .system(size: 30, weight: .light)
+        case .tile: return .system(size: 19, weight: .regular)
+        case .row, .compact: return .callout
+        }
+    }
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: size == .hero ? 6 : 4) {
+            Image(systemName: symbol)
+                .font(arrowFont)
+                .foregroundStyle(.secondary)
+            ValueText(parts, size: size, numeric: numeric)
+        }
+    }
+}
+
+/// One live history chart with its time span and an optional legend.
+private struct HistoryBlock<Legend: View>: View {
+    let caption: String
+    let chart: LineHistoryChart
+    @ViewBuilder var legend: () -> Legend
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            HStack(spacing: 8) {
-                Label(title, systemImage: symbol)
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(tint)
-                    .labelStyle(.titleAndIcon)
-                Spacer(minLength: 8)
-                accessory()
-            }
-
-            content()
-        }
-        .padding(20)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .cardBackground()
-    }
-}
-
-extension View {
-    func cardBackground() -> some View {
-        self
-            .background(
-                RoundedRectangle(cornerRadius: 20, style: .continuous)
-                    .fill(PulseSurface.card)
-                    .shadow(color: .black.opacity(0.05), radius: 1, y: 1)
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 20, style: .continuous)
-                    .strokeBorder(Color.primary.opacity(0.06), lineWidth: 0.5)
-            )
-    }
-}
-
-/// Big rounded number with a smaller unit, Health-app style.
-struct PrimaryValue: View {
-    let value: String
-    let unit: String
-    var caption: String? = nil
-    var tint: Color = .primary
-    var numeric: Double = 0
-
-    var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: unit == "%" ? 1 : 4) {
-            Text(value)
-                .font(.system(size: 30, weight: .semibold, design: .rounded))
-                .foregroundStyle(tint)
-                .monospacedDigit()
-                .contentTransition(.numericText(value: numeric))
-            Text(unit)
-                .font(.system(size: 15, weight: .semibold, design: .rounded))
-                .foregroundStyle(.secondary)
-            if let caption {
+            HStack(alignment: .firstTextBaseline) {
                 Text(caption)
-                    .font(.system(size: 13))
+                    .font(.caption)
                     .foregroundStyle(.secondary)
-                    .padding(.leading, 4)
+                    .accessibilityHidden(true)
+                Spacer(minLength: 12)
+                legend()
             }
+            chart
+                .frame(height: 190)
         }
-        .animation(.snappy, value: numeric)
+        .padding(.vertical, 6)
     }
 }
 
-// MARK: - CPU Card
-struct CPUCard: View {
-    let stats: SystemStats
-    let history: MetricHistory
-
-    var body: some View {
-        DashboardCard(title: "CPU", symbol: "cpu", tint: PulsePalette.cpu) {
-            StatusBadge(
-                title: stats.cpuSeverity.title,
-                symbol: stats.cpuSeverity >= .high ? "exclamationmark.triangle.fill" : "checkmark.circle.fill",
-                tint: PulsePalette.severityTint(stats.cpuSeverity, fallback: .green),
-                compact: true
-            )
-        } content: {
-            PrimaryValue(
-                value: "\(Int((stats.cpuUsage * 100).rounded()))",
-                unit: "%",
-                caption: "\(MachineInfo.coreCount) cores",
-                numeric: stats.cpuUsage
-            )
-
-            MetricHistoryChart(history: history, metric: .cpu)
-                .frame(height: 96)
-
-            CoreStrip(cores: stats.cpuCoreUsage)
-                .frame(height: 30)
-
-            HStack(spacing: 16) {
-                LegendItem(title: "User", value: PulseSharedSettings.percent(stats.cpuUser), color: PulsePalette.cpu)
-                LegendItem(title: "System", value: PulseSharedSettings.percent(stats.cpuSystem), color: .teal)
-                LegendItem(title: "Idle", value: PulseSharedSettings.percent(1 - stats.cpuUsage), color: Color.secondary.opacity(0.4))
-            }
+private extension HistoryBlock where Legend == EmptyView {
+    init(caption: String, chart: LineHistoryChart) {
+        self.init(caption: caption, chart: chart) {
+            EmptyView()
         }
     }
 }
 
-// MARK: - Memory Card
-struct MemoryCard: View {
-    let stats: SystemStats
-    let history: MetricHistory
-
-    private var pressureTitle: String {
-        switch stats.memoryPressureLevel {
-        case .normal?: return "Pressure Normal"
-        case .warning?: return "Pressure High"
-        case .critical?: return "Pressure Critical"
-        case nil: return stats.memorySeverity.title
-        }
-    }
+/// A legend row for a segmented bar: swatch, name, value.
+private struct SwatchRow: View {
+    let title: String
+    let index: Int
+    var tint: Color = PulseStyle.accent
+    /// Overrides the swatch's shade, matching a segment that overrides its own.
+    var color: Color? = nil
+    let value: String
 
     var body: some View {
-        DashboardCard(title: "Memory", symbol: "memorychip", tint: PulsePalette.memory) {
-            StatusBadge(
-                title: pressureTitle,
-                symbol: stats.memorySeverity >= .high ? "exclamationmark.triangle.fill" : "gauge.with.dots.needle.33percent",
-                tint: PulsePalette.severityTint(stats.memorySeverity, fallback: .green),
-                compact: true
-            )
-        } content: {
-            PrimaryValue(
-                value: String(format: stats.memoryUsed >= 10 ? "%.1f" : "%.2f", stats.memoryUsed),
-                unit: "GB",
-                caption: "of \(PulseSharedSettings.formatGigabytes(stats.memoryTotal))",
-                numeric: stats.memoryUsed
-            )
+        LabeledContent {
+            Text(value)
+                .monospacedDigit()
+        } label: {
+            HStack(spacing: 8) {
+                SegmentSwatch(index: index, tint: tint, color: color)
+                Text(title)
+            }
+        }
+    }
+}
 
-            MetricHistoryChart(history: history, metric: .memory)
-                .frame(height: 96)
+/// The page's single action, set trailing beneath the last group.
+private struct PageAction: View {
+    let title: String
+    var note: String? = nil
+    let action: () -> Void
 
-            SegmentedUsageBar(
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 16) {
+            if let note {
+                Text(note)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 0)
+            Button(title, action: action)
+        }
+        .padding(.top, 4)
+    }
+}
+
+private extension View {
+    /// Applies a severity text color only when there is one; otherwise leaves
+    /// the system's own label color in place.
+    @ViewBuilder
+    func attentionTint(_ color: Color?) -> some View {
+        if let color {
+            foregroundStyle(color)
+        } else {
+            self
+        }
+    }
+}
+
+// MARK: - CPU
+private struct CPUPage: View {
+    let context: PageContext
+    private var stats: SystemStats { context.stats }
+
+    var body: some View {
+        Form {
+            sections
+        }
+        .formStyle(.grouped)
+    }
+
+    @ViewBuilder
+    var sections: some View {
+        Section {
+            HistoryBlock(
+                caption: context.windowCaption,
+                chart: LineHistoryChart(
+                    values: context.history.samples.map(\.cpu),
+                    capacity: context.history.capacity,
+                    showsAxis: true,
+                    accessibilityTitle: "CPU history, \(context.windowCaption.lowercased())",
+                    latestTint: PulseStyle.markTint(for: MetricKind.cpu.markSeverity(in: stats))
+                )
+            )
+        } header: {
+            PageHeader(
+                value: PulseFormat.percent(stats.cpuUsage),
+                numeric: stats.cpuUsage,
+                caption: "User \(PulseFormat.percentText(stats.cpuUser)) · System \(PulseFormat.percentText(stats.cpuSystem))"
+            )
+        }
+
+        if !stats.cpuCoreUsage.isEmpty {
+            Section("Cores") {
+                // Captioned Efficiency | Performance clusters in the accent:
+                // per-core load is normal; severity belongs to the total.
+                CoreStrip(cores: stats.cpuCoreUsage)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.vertical, 6)
+            }
+        }
+
+        Section {
+            Group {
+                LabeledContent("Chip", value: MachineInfo.chipName)
+                LabeledContent("Uptime", value: PulseFormat.uptime(stats.uptime))
+                LabeledContent("Thermal state") {
+                    Text(stats.thermalLevel.title)
+                        .attentionTint(stats.thermalLevel.attentionTint)
+                }
+            }
+            .monospacedDigit()
+        }
+    }
+}
+
+// MARK: - Memory
+private struct MemoryPage: View {
+    let context: PageContext
+    private var stats: SystemStats { context.stats }
+
+    var body: some View {
+        Form {
+            sections
+        }
+        .formStyle(.grouped)
+    }
+
+    @ViewBuilder
+    var sections: some View {
+        Section {
+            // Occupancy is not a problem by itself, so the line stays the
+            // accent; memory pressure is said in words below.
+            HistoryBlock(
+                caption: context.windowCaption,
+                chart: LineHistoryChart(
+                    values: context.history.samples.map { $0.memory * stats.memoryTotal },
+                    capacity: context.history.capacity,
+                    upperBound: max(stats.memoryTotal, 1),
+                    showsAxis: true,
+                    axisLabel: { PulseFormat.capacityText($0) },
+                    accessibilityTitle: "Memory used, \(context.windowCaption.lowercased())",
+                    latestTint: PulseStyle.markTint(for: MetricKind.memory.markSeverity(in: stats))
+                )
+            )
+        } header: {
+            PageHeader(
+                value: PulseFormat.gigabytes(stats.memoryUsed),
+                numeric: stats.memoryUsed,
+                caption: "used of \(PulseFormat.capacityText(stats.memoryTotal)) · \(PulseFormat.percentText(stats.memoryUsage))"
+            )
+        }
+
+        Section {
+            SegmentedBar(
                 segments: [
-                    UsageSegment(id: "app", value: stats.memoryApp, color: PulsePalette.memory),
-                    UsageSegment(id: "wired", value: stats.memoryWired, color: .teal),
-                    UsageSegment(id: "compressed", value: stats.memoryCompressed, color: .indigo),
-                    UsageSegment(id: "cached", value: stats.memoryCached, color: Color.secondary.opacity(0.35))
+                    .init(id: "app", value: stats.memoryApp),
+                    .init(id: "wired", value: stats.memoryWired),
+                    .init(id: "compressed", value: stats.memoryCompressed)
                 ],
-                total: stats.memoryTotal,
-                height: 10
+                total: stats.memoryTotal
             )
-            .animation(.easeOut(duration: 0.35), value: stats.memoryUsed)
-
-            ViewThatFits(in: .horizontal) {
-                HStack(spacing: 14) {
-                    appLegend
-                    wiredLegend
-                    compressedLegend
-                    cachedLegend
-                }
-                Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 6) {
-                    GridRow {
-                        appLegend
-                        wiredLegend
-                    }
-                    GridRow {
-                        compressedLegend
-                        cachedLegend
-                    }
-                }
-            }
+            .padding(.vertical, 6)
+            SwatchRow(title: "App memory", index: 0, value: PulseFormat.gigabytesText(stats.memoryApp))
+            SwatchRow(title: "Wired memory", index: 1, value: PulseFormat.gigabytesText(stats.memoryWired))
+            SwatchRow(title: "Compressed", index: 2, value: PulseFormat.gigabytesText(stats.memoryCompressed))
         }
-    }
 
-    private var appLegend: some View {
-        LegendItem(title: "App", value: PulseSharedSettings.formatGigabytes(stats.memoryApp), color: PulsePalette.memory)
-    }
-
-    private var wiredLegend: some View {
-        LegendItem(title: "Wired", value: PulseSharedSettings.formatGigabytes(stats.memoryWired), color: .teal)
-    }
-
-    private var compressedLegend: some View {
-        LegendItem(title: "Compressed", value: PulseSharedSettings.formatGigabytes(stats.memoryCompressed), color: .indigo)
-    }
-
-    private var cachedLegend: some View {
-        LegendItem(title: "Cached", value: PulseSharedSettings.formatGigabytes(stats.memoryCached), color: Color.secondary.opacity(0.35))
-    }
-}
-
-// MARK: - Network Card
-struct NetworkCard: View {
-    let stats: SystemStats
-    let history: MetricHistory
-    @AppStorage(PulseSettings.Keys.unitsMode, store: PulseSettings.defaults) private var unitsModeRaw = PulseSettings.UnitsMode.automatic.rawValue
-
-    private var unitsMode: PulseSettings.UnitsMode {
-        PulseSettings.UnitsMode(rawValue: unitsModeRaw) ?? .automatic
-    }
-
-    var body: some View {
-        DashboardCard(title: "Network", symbol: "network", tint: PulsePalette.networkDown) {
-            if stats.networkUp < 1 && stats.networkDown < 1 {
-                StatusBadge(title: "Idle", symbol: "moon.zzz.fill", tint: .secondary, compact: true)
+        Section {
+            Group {
+                LabeledContent("Memory pressure") {
+                    Text(stats.memorySeverity.title)
+                        .attentionTint(PulseStyle.textTint(for: stats.memorySeverity))
+                }
+                LabeledContent("Cached files", value: PulseFormat.gigabytesText(stats.memoryCached))
+                LabeledContent("Swap used", value: stats.swapUsed > 0.005 ? PulseFormat.gigabytesText(stats.swapUsed) : "None")
             }
-        } content: {
-            HStack(alignment: .top, spacing: 28) {
-                rate(title: "Download", symbol: "arrow.down.circle.fill", value: stats.networkDown, tint: PulsePalette.networkDown)
-                rate(title: "Upload", symbol: "arrow.up.circle.fill", value: stats.networkUp, tint: PulsePalette.networkUp)
-            }
-
-            MetricHistoryChart(history: history, metric: .network)
-                .frame(height: 96)
-        }
-    }
-
-    private func rate(title: String, symbol: String, value: Double, tint: Color) -> some View {
-        let parts = PulseSharedSettings.formatSpeed(value, unitsMode: unitsMode).split(separator: " ", maxSplits: 1).map(String.init)
-        return VStack(alignment: .leading, spacing: 2) {
-            Label(title, systemImage: symbol)
-                .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(tint)
-                .symbolRenderingMode(.hierarchical)
-            PrimaryValue(value: parts.first ?? "0", unit: parts.count > 1 ? parts[1] : "", numeric: value)
+            .monospacedDigit()
         }
     }
 }
 
-// MARK: - Storage Card
-struct StorageCard: View {
-    let stats: SystemStats
+// MARK: - Storage
+private struct StoragePage: View {
+    let context: PageContext
+    private var stats: SystemStats { context.stats }
 
-    private var free: Double { max(stats.diskTotal - stats.diskUsed - stats.diskPurgeable, 0) }
+    /// Purgeable space is neither a problem nor free yet: a neutral shade.
+    private let purgeableColor = Color.secondary.opacity(0.45)
+
+    private var freeSpace: Double {
+        max(stats.diskAvailable - stats.diskPurgeable, 0)
+    }
+
+    /// Only the Used segment carries the disk's severity.
+    private var usedTint: Color {
+        PulseStyle.markTint(for: MetricKind.disk.markSeverity(in: stats))
+    }
+
+    private var footnote: String? {
+        stats.diskSeverity >= .high
+            ? "Freeing up space helps macOS install updates and keep your Mac responsive."
+            : nil
+    }
 
     var body: some View {
-        DashboardCard(title: "Storage", symbol: "internaldrive", tint: PulsePalette.disk) {
-            Button("Manage…") {
-                PulseActions.openStorageSettings()
-            }
-            .controlSize(.small)
-            .focusEffectDisabled()
-        } content: {
-            PrimaryValue(
-                value: storageNumber(stats.diskAvailable),
-                unit: "GB",
-                caption: "available of \(PulseSharedSettings.formatGigabytes(stats.diskTotal))",
-                numeric: stats.diskAvailable
-            )
+        Form {
+            sections
+        }
+        .formStyle(.grouped)
+    }
 
-            SegmentedUsageBar(
+    @ViewBuilder
+    var sections: some View {
+        Section {
+            SegmentedBar(
                 segments: [
-                    UsageSegment(id: "used", value: stats.diskUsed, color: PulsePalette.disk),
-                    UsageSegment(id: "purgeable", value: stats.diskPurgeable, color: PulsePalette.disk.opacity(0.35))
+                    .init(id: "used", value: stats.diskUsed),
+                    .init(id: "purgeable", value: stats.diskPurgeable, color: purgeableColor)
                 ],
                 total: stats.diskTotal,
-                height: 14
+                tint: usedTint
             )
-
-            HStack(spacing: 14) {
-                LegendItem(title: "Used", value: PulseSharedSettings.formatGigabytes(stats.diskUsed), color: PulsePalette.disk)
-                if stats.diskPurgeable > 0.1 {
-                    LegendItem(title: "Purgeable", value: PulseSharedSettings.formatGigabytes(stats.diskPurgeable), color: PulsePalette.disk.opacity(0.35))
-                }
-                LegendItem(title: "Free", value: PulseSharedSettings.formatGigabytes(free), color: Color.secondary.opacity(0.3))
-            }
-
-            Text(storageAdvice)
-                .font(.system(size: 12))
-                .foregroundStyle(stats.diskSeverity >= .high ? PulsePalette.severityTint(stats.diskSeverity, fallback: .secondary) : .secondary)
-                .fixedSize(horizontal: false, vertical: true)
+            .padding(.vertical, 6)
+            SwatchRow(title: "Used", index: 0, tint: usedTint, value: PulseFormat.gigabytesText(stats.diskUsed))
+            SwatchRow(title: "Purgeable", index: 1, color: purgeableColor, value: PulseFormat.gigabytesText(stats.diskPurgeable))
+            SwatchRow(title: "Free", index: -1, value: PulseFormat.gigabytesText(freeSpace))
+        } header: {
+            PageHeader(
+                value: PulseFormat.gigabytes(stats.diskAvailable),
+                numeric: stats.diskAvailable,
+                caption: "available of \(PulseFormat.capacityText(stats.diskTotal)) · \(PulseFormat.percentText(stats.diskUsage)) full"
+            )
         }
-    }
 
-    private func storageNumber(_ value: Double) -> String {
-        value >= 100 ? String(format: "%.0f", value) : String(format: "%.1f", value)
-    }
-
-    private var storageAdvice: String {
-        switch stats.diskSeverity {
-        case .nominal, .moderate:
-            return "Purgeable space is counted as available. macOS frees it automatically when needed."
-        case .high:
-            return "Storage is getting full. Review large files in Storage settings."
-        case .critical:
-            return "Your startup disk is almost full. Free up space to keep your Mac running smoothly."
-        }
-    }
-}
-
-// MARK: - Battery Card
-struct BatteryCard: View {
-    let stats: SystemStats
-
-    private var tint: Color {
-        PulsePalette.batteryTint(level: stats.batteryLevel, isCharging: stats.isCharging, hasBattery: stats.hasBattery)
-    }
-
-    var body: some View {
-        DashboardCard(title: "Battery", symbol: "battery.75percent", tint: .green) {
-            Button("Settings…") {
-                PulseActions.openBatterySettings()
-            }
-            .controlSize(.small)
-            .focusEffectDisabled()
-        } content: {
-            HStack(alignment: .center, spacing: 18) {
-                BatteryMeter(level: stats.batteryLevel, isCharging: stats.isCharging, tint: tint)
-                    .frame(width: 92, height: 44)
-
-                VStack(alignment: .leading, spacing: 2) {
-                    PrimaryValue(value: "\(stats.batteryLevel)", unit: "%", numeric: Double(stats.batteryLevel))
-                    Text(BatteryStatusText.describe(stats))
-                        .font(.system(size: 13, weight: .medium))
-                        .foregroundStyle(stats.isCharging ? .green : .secondary)
-                }
-            }
-
-            VStack(spacing: 0) {
-                DetailRow(title: "Power Source", value: BatteryStatusText.powerSource(stats))
-                Divider()
-                DetailRow(title: "Low Power Mode", value: ProcessInfo.processInfo.isLowPowerModeEnabled ? "On" : "Off")
+        Section {
+            LabeledContent("Volume", value: StartupVolume.name)
+            LabeledContent("Format", value: StartupVolume.format)
+            LabeledContent("Capacity", value: PulseFormat.capacityText(stats.diskTotal))
+                .monospacedDigit()
+        } footer: {
+            PageAction(title: "Storage Settings…", note: footnote) {
+                PulseActions.openStorageSettings()
             }
         }
     }
 }
 
-/// A large battery outline with a proportional fill.
-struct BatteryMeter: View {
-    let level: Int
-    let isCharging: Bool
-    let tint: Color
+// MARK: - Network
+private struct NetworkPage: View {
+    let context: PageContext
+    private var stats: SystemStats { context.stats }
+    private var samples: [MetricSample] { context.history.samples }
+
+    private func peak(_ keyPath: KeyPath<MetricSample, Double>) -> String {
+        context.speed(samples.map { $0[keyPath: keyPath] }.max() ?? 0)
+    }
+
+    private func average(_ keyPath: KeyPath<MetricSample, Double>) -> String {
+        guard !samples.isEmpty else { return context.speed(0) }
+        return context.speed(samples.reduce(0) { $0 + $1[keyPath: keyPath] } / Double(samples.count))
+    }
 
     var body: some View {
-        GeometryReader { geometry in
-            let capWidth = geometry.size.width * 0.06
-            let bodyWidth = geometry.size.width - capWidth - 2
-            HStack(spacing: 2) {
-                ZStack(alignment: .leading) {
-                    RoundedRectangle(cornerRadius: geometry.size.height * 0.24, style: .continuous)
-                        .strokeBorder(Color.secondary.opacity(0.45), lineWidth: 2)
-                    RoundedRectangle(cornerRadius: geometry.size.height * 0.16, style: .continuous)
-                        .fill(tint == .primary ? Color.primary.opacity(0.85) : tint)
-                        .frame(width: max((bodyWidth - 8) * CGFloat(min(max(level, 0), 100)) / 100, 4))
-                        .padding(4)
-                    if isCharging {
-                        Image(systemName: "bolt.fill")
-                            .font(.system(size: geometry.size.height * 0.45, weight: .bold))
-                            .foregroundStyle(.white)
-                            .shadow(color: .black.opacity(0.25), radius: 1)
-                            .frame(maxWidth: .infinity)
-                    }
-                }
-                .frame(width: bodyWidth)
-
-                RoundedRectangle(cornerRadius: 2, style: .continuous)
-                    .fill(Color.secondary.opacity(0.45))
-                    .frame(width: capWidth, height: geometry.size.height * 0.36)
-            }
+        Form {
+            sections
         }
-        .animation(.easeInOut(duration: 0.4), value: level)
+        .formStyle(.grouped)
+    }
+
+    @ViewBuilder
+    var sections: some View {
+        let axis = SpeedAxis(ceiling: context.history.networkCeiling, unitsMode: context.unitsMode)
+
+        Section {
+            // The chart's caption states the span once; the peak and average
+            // rows sit directly beneath it and share it.
+            HistoryBlock(
+                caption: context.windowCaption,
+                chart: LineHistoryChart(
+                    values: samples.map(\.networkDown),
+                    capacity: context.history.capacity,
+                    secondaryValues: samples.map(\.networkUp),
+                    upperBound: axis.ceiling,
+                    showsAxis: true,
+                    axisLabel: { axis.isTick($0) ? axis.tickLabel($0) : context.speed($0) },
+                    accessibilityTitle: "Download history, \(context.windowCaption.lowercased())"
+                )
+            ) {
+                HStack(spacing: 14) {
+                    LegendKey(title: "Download", style: .solid)
+                    LegendKey(title: "Upload", style: .dashed)
+                }
+            }
+        } header: {
+            HStack(alignment: .top, spacing: 24) {
+                RateHeader(title: "Download", parts: context.speedParts(stats.networkDown), numeric: stats.networkDown)
+                RateHeader(title: "Upload", parts: context.speedParts(stats.networkUp), numeric: stats.networkUp)
+            }
+            .textCase(nil)
+            .padding(.bottom, 10)
+        }
+
+        Section {
+            Group {
+                LabeledContent("Peak download", value: peak(\.networkDown))
+                LabeledContent("Peak upload", value: peak(\.networkUp))
+                LabeledContent("Average download", value: average(\.networkDown))
+                LabeledContent("Average upload", value: average(\.networkUp))
+            }
+            .monospacedDigit()
+        }
+    }
+}
+
+/// One direction of the Network header: a quiet label over a large number.
+private struct RateHeader: View {
+    let title: String
+    let parts: (number: String, unit: String)
+    let numeric: Double
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text(title)
+                .font(.subheadline)
+                .fontWeight(.regular)
+                .foregroundStyle(.secondary)
+            ValueText(parts, size: .hero, numeric: numeric)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .combine)
+    }
+}
+
+/// A short line drawn exactly like its series, then the series name.
+private struct LegendKey: View {
+    enum Style { case solid, dashed }
+
+    let title: String
+    let style: Style
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Path { path in
+                path.move(to: CGPoint(x: 1, y: 1))
+                path.addLine(to: CGPoint(x: 15, y: 1))
+            }
+            .stroke(
+                style == .solid ? AnyShapeStyle(PulseStyle.accent) : AnyShapeStyle(Color.secondary),
+                style: StrokeStyle(
+                    lineWidth: style == .solid ? 1.5 : 1.2,
+                    lineCap: .round,
+                    dash: style == .solid ? [] : [3, 2]
+                )
+            )
+            .frame(width: 16, height: 2)
+            Text(title)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
         .accessibilityHidden(true)
     }
 }
 
-// MARK: - System Card
-struct SystemCard: View {
-    let stats: SystemStats
+// MARK: - Battery
+private struct BatteryPage: View {
+    let context: PageContext
+    private var stats: SystemStats { context.stats }
 
-    var body: some View {
-        DashboardCard(title: "This Mac", symbol: "laptopcomputer", tint: .secondary) {
-            EmptyView()
-        } content: {
-            VStack(spacing: 0) {
-                DetailRow(title: "Chip", value: MachineInfo.chipName)
-                Divider()
-                DetailRow(title: "Memory", value: PulseSharedSettings.formatGigabytes(stats.memoryTotal))
-                Divider()
-                DetailRow(title: "Software", value: MachineInfo.osVersion)
-                Divider()
-                DetailRow(title: "Uptime", value: PulseSharedSettings.formatUptime(stats.uptime))
-                Divider()
-                HStack {
-                    Text("Thermal State")
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                    Circle()
-                        .fill(stats.thermalLevel.tint)
-                        .frame(width: 7, height: 7)
-                    Text(stats.thermalLevel.title)
-                }
-                .font(.system(size: 13))
-                .padding(.vertical, 7)
-                if stats.swapUsed > 0.05 {
-                    Divider()
-                    DetailRow(title: "Swap Used", value: PulseSharedSettings.formatGigabytes(stats.swapUsed))
-                }
-            }
-        }
+    private var timeRow: (title: String, value: String) {
+        let value = stats.batteryMinutesRemaining.map { PulseFormat.batteryTime(minutes: $0) } ?? "—"
+        if stats.isCharging { return ("Time until full", value) }
+        return ("Time remaining", stats.isPluggedIn ? "—" : value)
     }
-}
-
-struct DetailRow: View {
-    let title: String
-    let value: String
 
     var body: some View {
-        HStack {
-            Text(title)
-                .foregroundStyle(.secondary)
-            Spacer(minLength: 12)
-            Text(value)
-                .multilineTextAlignment(.trailing)
+        Form {
+            sections
+        }
+        .formStyle(.grouped)
+    }
+
+    /// The caption already names the power source ("On battery power",
+    /// "Charging", "Power adapter"), so no row repeats it.
+    @ViewBuilder
+    var sections: some View {
+        Section {
+            UsageBar(value: Double(stats.batteryLevel) / 100, tint: PulseStyle.batteryMarkTint(stats), height: 6)
+                .padding(.vertical, 8)
+
+            LabeledContent(timeRow.title, value: timeRow.value)
                 .monospacedDigit()
-                .lineLimit(1)
-        }
-        .font(.system(size: 13))
-        .padding(.vertical, 7)
-        .accessibilityElement(children: .combine)
-    }
-}
-
-// MARK: - Charts
-/// Live history for one metric. The x-domain is fixed to the window so the
-/// line enters from the right and scrolls, like Activity Monitor.
-struct MetricHistoryChart: View {
-    enum Metric { case cpu, memory, network }
-
-    let history: MetricHistory
-    let metric: Metric
-
-    private var domain: ClosedRange<Int> {
-        let upper = history.samples.last?.id ?? 0
-        return (upper - history.capacity + 1)...upper
-    }
-
-    var body: some View {
-        Chart {
-            switch metric {
-            case .cpu:
-                usageMarks(\.cpu, tint: PulsePalette.cpu, label: "CPU")
-            case .memory:
-                usageMarks(\.memory, tint: PulsePalette.memory, label: "Memory")
-            case .network:
-                ForEach(history.samples) { sample in
-                    AreaMark(x: .value("Time", sample.id), y: .value("Download", sample.networkDown))
-                        .foregroundStyle(gradient(PulsePalette.networkDown))
-                        .interpolationMethod(.monotone)
-                    LineMark(x: .value("Time", sample.id), y: .value("Download", sample.networkDown), series: .value("Direction", "Download"))
-                        .foregroundStyle(PulsePalette.networkDown)
-                        .lineStyle(StrokeStyle(lineWidth: 1.8, lineCap: .round, lineJoin: .round))
-                        .interpolationMethod(.monotone)
-                    LineMark(x: .value("Time", sample.id), y: .value("Upload", sample.networkUp), series: .value("Direction", "Upload"))
-                        .foregroundStyle(PulsePalette.networkUp)
-                        .lineStyle(StrokeStyle(lineWidth: 1.8, lineCap: .round, lineJoin: .round))
-                        .interpolationMethod(.monotone)
-                }
+            LabeledContent("Low Power Mode", value: ProcessInfo.processInfo.isLowPowerModeEnabled ? "On" : "Off")
+        } header: {
+            PageHeader(
+                value: ("\(stats.batteryLevel)", "%"),
+                numeric: Double(stats.batteryLevel),
+                caption: BatteryStatusText.powerState(stats)
+            )
+        } footer: {
+            PageAction(title: "Battery Settings…") {
+                PulseActions.openBatterySettings()
             }
-        }
-        .chartXScale(domain: domain)
-        .chartYScale(domain: 0...yUpperBound)
-        .chartXAxis(.hidden)
-        .chartYAxis {
-            AxisMarks(position: .trailing, values: yAxisValues) { value in
-                AxisGridLine(stroke: StrokeStyle(lineWidth: 0.5, dash: [2, 3]))
-                    .foregroundStyle(Color.secondary.opacity(0.35))
-                AxisValueLabel {
-                    if let number = value.as(Double.self) {
-                        Text(axisLabel(number))
-                            .font(.system(size: 9, weight: .medium))
-                            .foregroundStyle(.tertiary)
-                    }
-                }
-            }
-        }
-        .chartLegend(.hidden)
-        .accessibilityLabel(Text(accessibilitySummary))
-    }
-
-    @ChartContentBuilder
-    private func usageMarks(_ keyPath: KeyPath<MetricSample, Double>, tint: Color, label: String) -> some ChartContent {
-        ForEach(history.samples) { sample in
-            AreaMark(x: .value("Time", sample.id), y: .value(label, sample[keyPath: keyPath]))
-                .foregroundStyle(gradient(tint))
-                .interpolationMethod(.monotone)
-            LineMark(x: .value("Time", sample.id), y: .value(label, sample[keyPath: keyPath]))
-                .foregroundStyle(tint)
-                .lineStyle(StrokeStyle(lineWidth: 1.8, lineCap: .round, lineJoin: .round))
-                .interpolationMethod(.monotone)
-        }
-    }
-
-    private func gradient(_ tint: Color) -> LinearGradient {
-        LinearGradient(colors: [tint.opacity(0.32), tint.opacity(0.02)], startPoint: .top, endPoint: .bottom)
-    }
-
-    private var yUpperBound: Double {
-        metric == .network ? history.networkCeiling : 1
-    }
-
-    private var yAxisValues: [Double] {
-        metric == .network ? [0, yUpperBound / 2, yUpperBound] : [0, 0.5, 1]
-    }
-
-    private func axisLabel(_ value: Double) -> String {
-        guard metric == .network else {
-            return "\(Int((value * 100).rounded()))%"
-        }
-        if value <= 0 { return "0" }
-        return PulseSharedSettings.formatSpeed(value, unitsMode: .automatic)
-    }
-
-    private var accessibilitySummary: String {
-        switch metric {
-        case .cpu: return "CPU history over the last \(history.samples.count) samples"
-        case .memory: return "Memory history over the last \(history.samples.count) samples"
-        case .network: return "Network history over the last \(history.samples.count) samples"
         }
     }
 }
 
-/// CPU and memory together, for compact surfaces like the menu bar.
-struct UsageHistoryChart: View {
-    let history: MetricHistory
-    var showsAxis = true
+// MARK: - Speed Axis
+/// A network chart's vertical scale in one unit. The ceiling is rounded up so
+/// its half is a clean tick too, and all three ticks (0, half, ceiling) share
+/// KB/s or MB/s, chosen from the ceiling, so the reader never converts
+/// between gridlines ("0 MB/s · 0.5 MB/s · 1.0 MB/s").
+private struct SpeedAxis {
+    /// The top of the chart, in KB/s.
+    let ceiling: Double
+    let usesMegabytes: Bool
+    /// Decimals shared by every non-zero tick.
+    private let decimals: Int
 
-    private var domain: ClosedRange<Int> {
-        let upper = history.samples.last?.id ?? 0
-        return (upper - history.capacity + 1)...upper
+    init(ceiling kilobytes: Double, unitsMode: PulseSharedSettings.UnitsMode) {
+        // KB/s: halves of 10, 20, 30… are whole numbers. MB/s: even steps,
+        // so sub-1 MB/s ceilings keep a one-decimal half (0.2, 0.4…).
+        let kilobyteCeiling = Self.rounded(max(kilobytes, 8), steps: [1, 2, 3, 4, 5, 6, 8, 10])
+        switch unitsMode {
+        case .automatic:
+            // Same switch as the figures: never a four-digit KB/s tick.
+            usesMegabytes = kilobyteCeiling >= 999.5
+        case .kilobytesPerSecond:
+            usesMegabytes = false
+        case .megabytesPerSecond:
+            usesMegabytes = true
+        }
+
+        if usesMegabytes {
+            let megabytes = Self.rounded(max(kilobytes / 1024, 0.2), steps: [1, 2, 4, 6, 8, 10])
+            ceiling = megabytes * 1024
+            decimals = Self.decimals(for: megabytes / 2)
+        } else {
+            ceiling = kilobyteCeiling
+            decimals = 0
+        }
     }
 
-    var body: some View {
-        Chart {
-            ForEach(history.samples) { sample in
-                AreaMark(x: .value("Time", sample.id), y: .value("CPU", sample.cpu))
-                    .foregroundStyle(LinearGradient(colors: [PulsePalette.cpu.opacity(0.3), PulsePalette.cpu.opacity(0)], startPoint: .top, endPoint: .bottom))
-                    .interpolationMethod(.monotone)
-                LineMark(x: .value("Time", sample.id), y: .value("CPU", sample.cpu), series: .value("Metric", "CPU"))
-                    .foregroundStyle(PulsePalette.cpu)
-                    .lineStyle(StrokeStyle(lineWidth: 1.5, lineCap: .round))
-                    .interpolationMethod(.monotone)
-                LineMark(x: .value("Time", sample.id), y: .value("Memory", sample.memory), series: .value("Metric", "Memory"))
-                    .foregroundStyle(PulsePalette.memory)
-                    .lineStyle(StrokeStyle(lineWidth: 1.5, lineCap: .round))
-                    .interpolationMethod(.monotone)
-            }
+    /// True for the values the chart draws as ticks.
+    func isTick(_ kilobytes: Double) -> Bool {
+        [0, ceiling / 2, ceiling].contains { abs($0 - kilobytes) <= ceiling * 1e-6 }
+    }
+
+    /// "0.5 MB/s". Ticks too wide for the axis column ("2,000 KB/s" with the
+    /// KB/s setting) drop their unit; the zero tick always keeps it, so the
+    /// axis still names its one unit.
+    func tickLabel(_ kilobytes: Double) -> String {
+        let unit = usesMegabytes ? "MB/s" : "KB/s"
+        let isZero = kilobytes <= ceiling * 1e-6
+        guard !isZero else { return "0 \(unit)" }
+        let number = usesMegabytes
+            ? String(format: "%.\(decimals)f", kilobytes / 1024)
+            : PulseFormat.speed(kilobytes, unitsMode: .kilobytesPerSecond).number
+        let label = "\(number) \(unit)"
+        return label.count <= 8 ? label : number
+    }
+
+    /// `value` rounded up to the next step × power of ten.
+    private static func rounded(_ value: Double, steps: [Double]) -> Double {
+        let magnitude = pow(10, floor(log10(value)))
+        let step = steps.first { $0 * magnitude >= value * (1 - 1e-9) } ?? 10
+        return step * magnitude
+    }
+
+    /// The decimals needed to write `value` exactly (0.5 → 1, 3 → 0).
+    private static func decimals(for value: Double) -> Int {
+        var places = 0
+        while places < 3, abs(value * pow(10, Double(places)) - (value * pow(10, Double(places))).rounded()) > 1e-6 {
+            places += 1
         }
-        .chartXScale(domain: domain)
-        .chartYScale(domain: 0...1)
-        .chartXAxis(.hidden)
-        .chartYAxis(showsAxis ? .automatic : .hidden)
-        .chartLegend(.hidden)
-        .accessibilityLabel(Text("CPU and memory history"))
+        return places
     }
 }
 
-// MARK: - Widget Gallery
-struct WidgetGallery: View {
-    let stats: SystemStats
+// MARK: - Machine Details
+private enum StartupVolume {
+    private static let values = try? URL(fileURLWithPath: "/").resourceValues(forKeys: [
+        .volumeLocalizedNameKey,
+        .volumeLocalizedFormatDescriptionKey
+    ])
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            VStack(alignment: .leading, spacing: 3) {
-                Text("Widgets")
-                    .font(.system(size: 20, weight: .bold))
-                Text("Right-click your desktop and choose Edit Widgets, then search for Pulse.")
-                    .font(.system(size: 13))
-                    .foregroundStyle(.secondary)
-            }
-
-            ScrollView(.horizontal) {
-                HStack(alignment: .top, spacing: 24) {
-                    preview("Small", width: 170, height: 170) { SmallWidgetView(stats: stats) }
-                    preview("Medium", width: 364, height: 170) { MediumWidgetView(stats: stats) }
-                    preview("Large", width: 364, height: 382) { LargeWidgetView(stats: stats) }
-                }
-                .padding(.vertical, 10)
-                .padding(.horizontal, 2)
-            }
-            .scrollIndicators(.hidden)
-        }
-    }
-
-    private func preview<Content: View>(_ title: String, width: CGFloat, height: CGFloat, @ViewBuilder content: () -> Content) -> some View {
-        VStack(spacing: 10) {
-            content()
-                .frame(width: width, height: height)
-                .background(PulseSurface.card, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
-                .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
-                .shadow(color: .black.opacity(0.12), radius: 14, y: 6)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 22, style: .continuous)
-                        .strokeBorder(Color.primary.opacity(0.06), lineWidth: 0.5)
-                )
-            Text(title)
-                .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(.secondary)
-        }
-        .accessibilityElement(children: .contain)
-        .accessibilityLabel(Text("\(title) widget preview"))
-    }
+    static let name = values?.volumeLocalizedName ?? "Macintosh HD"
+    static let format = values?.volumeLocalizedFormatDescription ?? "APFS"
 }

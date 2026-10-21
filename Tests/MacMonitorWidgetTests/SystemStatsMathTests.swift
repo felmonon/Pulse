@@ -225,9 +225,9 @@ final class SystemStatsMathTests: XCTestCase {
     // MARK: - Gigabyte Formatting
 
     func testFormatGigabytesScalesPrecisionWithMagnitude() {
-        XCTAssertEqual(PulseSharedSettings.formatGigabytes(0), "0.00 GB")
-        XCTAssertEqual(PulseSharedSettings.formatGigabytes(4.2), "4.20 GB")
-        XCTAssertEqual(PulseSharedSettings.formatGigabytes(8.5), "8.50 GB")
+        XCTAssertEqual(PulseSharedSettings.formatGigabytes(0), "0.0 GB")
+        XCTAssertEqual(PulseSharedSettings.formatGigabytes(4.2), "4.2 GB")
+        XCTAssertEqual(PulseSharedSettings.formatGigabytes(8.5), "8.5 GB")
         XCTAssertEqual(PulseSharedSettings.formatGigabytes(12.34), "12.3 GB")
         XCTAssertEqual(PulseSharedSettings.formatGigabytes(16.0), "16.0 GB")
         XCTAssertEqual(PulseSharedSettings.formatGigabytes(99.9), "99.9 GB")
@@ -236,12 +236,12 @@ final class SystemStatsMathTests: XCTestCase {
     }
 
     func testFormatGigabytesClampsNegativeToZero() {
-        XCTAssertEqual(PulseSharedSettings.formatGigabytes(-10.0), "0.00 GB")
+        XCTAssertEqual(PulseSharedSettings.formatGigabytes(-10.0), "0.0 GB")
     }
 
     func testFormatGigabytesSanitizesNonFiniteValues() {
-        XCTAssertEqual(PulseSharedSettings.formatGigabytes(.nan), "0.00 GB")
-        XCTAssertEqual(PulseSharedSettings.formatGigabytes(.infinity), "0.00 GB")
+        XCTAssertEqual(PulseSharedSettings.formatGigabytes(.nan), "0.0 GB")
+        XCTAssertEqual(PulseSharedSettings.formatGigabytes(.infinity), "0.0 GB")
     }
 
     // MARK: - Smoothing / Sanitization
@@ -473,5 +473,60 @@ final class SystemStatsMathTests: XCTestCase {
         XCTAssertEqual(PulseSharedSettings.intervalDescription(1), "Every second")
         XCTAssertEqual(PulseSharedSettings.intervalDescription(15), "Every 15 seconds")
         XCTAssertEqual(PulseSharedSettings.intervalDescription(60), "Every minute")
+    }
+
+    // MARK: - Severity latch
+
+    func testLatchAdoptsFirstReadingImmediately() {
+        var latch = SystemStatsMath.SeverityLatch(enterSamples: 3, exitSamples: 8)
+        XCTAssertEqual(latch.update(.critical), .critical)
+    }
+
+    func testLatchRaisesOnlyAfterSustainedSamples() {
+        var latch = SystemStatsMath.SeverityLatch(enterSamples: 3, exitSamples: 8)
+        _ = latch.update(.nominal)
+        XCTAssertEqual(latch.update(.high), .nominal)
+        XCTAssertEqual(latch.update(.high), .nominal)
+        XCTAssertEqual(latch.update(.high), .high)
+    }
+
+    func testLatchIgnoresASingleSpike() {
+        var latch = SystemStatsMath.SeverityLatch(enterSamples: 3, exitSamples: 8)
+        _ = latch.update(.nominal)
+        XCTAssertEqual(latch.update(.high), .nominal)
+        XCTAssertEqual(latch.update(.nominal), .nominal)
+        XCTAssertEqual(latch.update(.high), .nominal)
+        XCTAssertEqual(latch.update(.high), .nominal)
+        XCTAssertEqual(latch.update(.high), .high)
+    }
+
+    func testLatchLowersOnlyAfterLongerCalm() {
+        var latch = SystemStatsMath.SeverityLatch(enterSamples: 2, exitSamples: 4)
+        _ = latch.update(.high)
+        for _ in 0..<3 {
+            XCTAssertEqual(latch.update(.nominal), .high)
+        }
+        XCTAssertEqual(latch.update(.nominal), .nominal)
+    }
+
+    func testLatchedSeverityOverridesRawSeverity() {
+        var stats = SystemStats.placeholder
+        stats.cpuUsage = 0.95
+        XCTAssertEqual(stats.rawCPUSeverity, .critical)
+        stats.latchedCPUSeverity = .nominal
+        XCTAssertEqual(stats.cpuSeverity, .nominal)
+    }
+
+    // MARK: - Speed thresholds
+
+    func testAutomaticSpeedNeverShowsFourKilobyteDigits() {
+        XCTAssertEqual(PulseSharedSettings.formatSpeed(999, unitsMode: .automatic), "999 KB/s")
+        XCTAssertEqual(PulseSharedSettings.formatSpeed(1006, unitsMode: .automatic), "1.0 MB/s")
+    }
+
+    func testKilobyteModeGroupsThousands() {
+        let text = PulseSharedSettings.formatSpeed(12_345, unitsMode: .kilobytesPerSecond)
+        XCTAssertTrue(text.hasSuffix(" KB/s"))
+        XCTAssertGreaterThan(text.count, "12345 KB/s".count, "expected a grouping separator in \(text)")
     }
 }

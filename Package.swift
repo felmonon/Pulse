@@ -13,6 +13,7 @@ let package = Package(
             path: "Sources",
             exclude: [
                 "Assets.xcassets",
+                "AppIcon.icon",
                 "Info.plist",
                 "MacMonitorApp.entitlements",
                 "MacMonitorApp.swift",

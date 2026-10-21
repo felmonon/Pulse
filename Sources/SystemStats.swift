@@ -40,7 +40,7 @@ enum ThermalLevel: Int, Codable {
 
 /// Coarse classification of how loaded a metric is, used to tint rings and
 /// give the widget a glanceable "is something under pressure?" signal.
-enum LoadSeverity: Int, Comparable {
+enum LoadSeverity: Int, Comparable, Codable {
     case nominal = 0
     case moderate = 1
     case high = 2
@@ -130,22 +130,37 @@ struct SystemStats: Codable {
     var batteryMinutesRemaining: Int? = nil
     var thermalLevel: ThermalLevel = .nominal
     var uptime: TimeInterval = 0
+    /// False for a process's first reading, which has no previous counters:
+    /// its CPU is the since-boot average and its network rate is zero. Such a
+    /// sample is shown only until a real delta exists and is never charted.
+    var isWarmSample: Bool = true
+    /// Severities after hysteresis (see `SystemStatsMath.SeverityLatch`).
+    /// When set, every surface reads these so colors and wording change
+    /// together and never flicker on a single noisy sample.
+    var latchedCPUSeverity: LoadSeverity? = nil
+    var latchedMemorySeverity: LoadSeverity? = nil
+    var latchedDiskSeverity: LoadSeverity? = nil
 
     var isStale: Bool {
         Date().timeIntervalSince(timestamp) > 120
     }
 
     var cpuSeverity: LoadSeverity {
-        .cpu(usage: cpuUsage)
+        latchedCPUSeverity ?? .cpu(usage: cpuUsage)
     }
 
     var memorySeverity: LoadSeverity {
-        .memory(usage: memoryUsage, pressureLevel: memoryPressureLevel)
+        latchedMemorySeverity ?? .memory(usage: memoryUsage, pressureLevel: memoryPressureLevel)
     }
 
     var diskSeverity: LoadSeverity {
-        .disk(usage: diskUsage)
+        latchedDiskSeverity ?? .disk(usage: diskUsage)
     }
+
+    /// Raw, per-sample severities (input to the latches).
+    var rawCPUSeverity: LoadSeverity { .cpu(usage: cpuUsage) }
+    var rawMemorySeverity: LoadSeverity { .memory(usage: memoryUsage, pressureLevel: memoryPressureLevel) }
+    var rawDiskSeverity: LoadSeverity { .disk(usage: diskUsage) }
 
     static var placeholder: SystemStats {
         SystemStats(
@@ -193,7 +208,6 @@ enum PulseSharedDefaults {
         "settings.showBattery",
         "settings.showDisk",
         "settings.showNetwork",
-        "settings.showActiveApps",
         "settings.islandEnabled",
         "settings.islandChargingActivity",
         "settings.menuBarStyle"
@@ -255,7 +269,6 @@ enum PulseSharedSettings {
         static let showBattery = "settings.showBattery"
         static let showDisk = "settings.showDisk"
         static let showNetwork = "settings.showNetwork"
-        static let showActiveApps = "settings.showActiveApps"
         static let islandEnabled = "settings.islandEnabled"
         static let islandChargingActivity = "settings.islandChargingActivity"
         static let menuBarStyle = "settings.menuBarStyle"
@@ -271,9 +284,9 @@ enum PulseSharedSettings {
 
         var title: String {
             switch self {
-            case .iconOnly: return "Icon Only"
-            case .busiest: return "Busiest Metric"
-            case .cpuAndMemory: return "CPU and Memory"
+            case .iconOnly: return "Icon only"
+            case .busiest: return "Busiest metric"
+            case .cpuAndMemory: return "CPU and memory"
             }
         }
     }
@@ -344,30 +357,43 @@ enum PulseSharedSettings {
     /// Used everywhere storage/memory appears so the unit is always GB and
     /// the precision scales sensibly with magnitude (234 GB, not 234.5 GB).
     static func formatGigabytes(_ value: Double) -> String {
-        guard value.isFinite else { return "0.00 GB" }
+        guard value.isFinite else { return "0.0 GB" }
         let clamped = max(value, 0)
         if clamped >= 100 {
             return String(format: "%.0f GB", clamped)
         }
-        if clamped >= 10 {
-            return String(format: "%.1f GB", clamped)
-        }
-        return String(format: "%.2f GB", clamped)
+        // One decimal keeps live values steady in the last digit and matches
+        // across the window, menu, notch and widgets.
+        return String(format: "%.1f GB", clamped)
     }
 
     static func formatSpeed(_ speed: Double, unitsMode: UnitsMode) -> String {
         let speed = SystemStatsMath.sanitizeSpeed(speed)
         switch unitsMode {
         case .automatic:
-            if speed >= 1024 {
+            // Switch before a value would need four KB digits ("1006 KB/s"),
+            // so every rate is at most "999 KB/s" or "9.9 MB/s" wide.
+            if speed >= 999.5 {
                 return formatMegabytes(speed / 1024)
             }
             return String(format: "%.0f KB/s", speed)
         case .kilobytesPerSecond:
-            return String(format: "%.0f KB/s", speed)
+            return "\(groupedInteger(speed)) KB/s"
         case .megabytesPerSecond:
             return formatMegabytes(speed / 1024)
         }
+    }
+
+    private static let groupingFormatter: NumberFormatter = {
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .decimal
+        formatter.maximumFractionDigits = 0
+        formatter.usesGroupingSeparator = true
+        return formatter
+    }()
+
+    private static func groupedInteger(_ value: Double) -> String {
+        groupingFormatter.string(from: NSNumber(value: value.rounded())) ?? String(format: "%.0f", value)
     }
 
     private static func formatMegabytes(_ value: Double) -> String {
@@ -657,6 +683,52 @@ enum SystemStatsMath {
     private static func clamp(_ value: Double) -> Double {
         unitInterval(value)
     }
+
+    /// Hysteresis for severities sampled every second. A higher level takes
+    /// effect only after it has held for `enterSamples` consecutive samples;
+    /// a lower one only after `exitSamples`. One noisy sample never changes a
+    /// color or a sentence.
+    struct SeverityLatch: Equatable {
+        let enterSamples: Int
+        let exitSamples: Int
+        private(set) var current: LoadSeverity = .nominal
+        private var candidate: LoadSeverity = .nominal
+        private var streak = 0
+        private var primed = false
+
+        init(enterSamples: Int, exitSamples: Int) {
+            self.enterSamples = max(enterSamples, 1)
+            self.exitSamples = max(exitSamples, 1)
+        }
+
+        mutating func update(_ raw: LoadSeverity) -> LoadSeverity {
+            // The very first reading is adopted directly, so a Mac that is
+            // already under load (or a full disk) reads correctly at launch.
+            guard primed else {
+                primed = true
+                current = raw
+                candidate = raw
+                return current
+            }
+            guard raw != current else {
+                streak = 0
+                candidate = current
+                return current
+            }
+            if raw == candidate {
+                streak += 1
+            } else {
+                candidate = raw
+                streak = 1
+            }
+            let needed = raw > current ? enterSamples : exitSamples
+            if streak >= needed {
+                current = raw
+                streak = 0
+            }
+            return current
+        }
+    }
 }
 
 // MARK: - Metric History
@@ -695,6 +767,12 @@ struct MetricHistory: Equatable {
         }
     }
 
+    /// Drop every sample, e.g. when the sampling cadence changes so the
+    /// chart's time span stays honest.
+    mutating func removeAll() {
+        samples.removeAll()
+    }
+
     mutating func append(_ stats: SystemStats) {
         append(
             cpu: stats.cpuUsage,
@@ -702,6 +780,20 @@ struct MetricHistory: Equatable {
             networkUp: stats.networkUp,
             networkDown: stats.networkDown
         )
+    }
+
+    /// A deterministic, realistic-looking window for previews and screenshots.
+    static func preview(capacity: Int = 90) -> MetricHistory {
+        var history = MetricHistory(capacity: capacity)
+        for step in 0..<capacity {
+            let t = Double(step)
+            let cpu = 0.22 + 0.10 * sin(t / 7) + 0.06 * sin(t / 2.3) + (step % 23 == 0 ? 0.25 : 0)
+            let memory = 0.71 + 0.03 * sin(t / 19)
+            let down = max(40 + 900 * pow(max(sin(t / 9), 0), 6) + 30 * sin(t / 1.7), 0)
+            let up = max(12 + 60 * pow(max(sin(t / 13 + 1), 0), 4), 0)
+            history.append(cpu: cpu, memory: memory, networkUp: up, networkDown: down)
+        }
+        return history
     }
 
     /// Highest combined network speed in the window, floored so a quiet link
@@ -728,6 +820,24 @@ enum MachineInfo {
     }()
 
     static let coreCount = ProcessInfo.processInfo.activeProcessorCount
+
+    /// Logical CPU counts per cluster on Apple silicon (perflevel0 is the
+    /// performance cluster, perflevel1 efficiency). Nil when unavailable or
+    /// when they don't add up to the core count.
+    static let coreClusters: (performance: Int, efficiency: Int)? = {
+        func count(_ name: String) -> Int? {
+            var value: Int32 = 0
+            var size = MemoryLayout<Int32>.size
+            guard sysctlbyname(name, &value, &size, nil, 0) == 0, value > 0 else { return nil }
+            return Int(value)
+        }
+        guard let performance = count("hw.perflevel0.logicalcpu"),
+              let efficiency = count("hw.perflevel1.logicalcpu"),
+              performance + efficiency == ProcessInfo.processInfo.activeProcessorCount else {
+            return nil
+        }
+        return (performance, efficiency)
+    }()
 
     static let osVersion: String = {
         let version = ProcessInfo.processInfo.operatingSystemVersion
@@ -757,9 +867,41 @@ class SystemMonitor {
     private var smoothedNetworkUp: Double?
     private var smoothedNetworkDown: Double?
 
+    /// Forget counters and smoothing so the next reading starts fresh. Used
+    /// by short-lived processes (the widget extension) whose last baseline may
+    /// be minutes old.
+    func resetBaseline() {
+        samplingLock.lock()
+        defer { samplingLock.unlock() }
+        previousCPUTicks = nil
+        previousNetworkCounters = nil
+        smoothedCPU = nil
+        smoothedCPUUser = nil
+        smoothedCPUSystem = nil
+        smoothedCores = []
+        smoothedNetworkUp = nil
+        smoothedNetworkDown = nil
+    }
+
+    /// A reading over a short, fresh interval: primes the counters, waits,
+    /// then samples, so CPU and network reflect the last half-second rather
+    /// than the since-boot average or a stale baseline.
+    func freshStats(interval: TimeInterval = 0.5, completion: @escaping (SystemStats) -> Void) {
+        resetBaseline()
+        _ = getStats()
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + interval) {
+            completion(self.getStats())
+        }
+    }
+
     func getStats() -> SystemStats {
         samplingLock.lock()
         defer { samplingLock.unlock() }
+
+        // A process's first reading has no previous counters: CPU would be the
+        // since-boot average and network zero. Flag it and keep it out of the
+        // smoothing so it never biases the readings that follow.
+        let isWarm = previousCPUTicks != nil && previousNetworkCounters != nil
 
         // Keep every field in this snapshot on the same serialized sample.
         let memory = getMemoryUsage()
@@ -768,6 +910,13 @@ class SystemMonitor {
         let network = getNetworkSpeed()
 
         let breakdown = getCPUBreakdown()
+        guard isWarm else {
+            return makeStats(
+                cpu: breakdown.total, cpuUser: breakdown.user, cpuSystem: breakdown.system,
+                cores: breakdown.cores, netUp: 0, netDown: 0,
+                memory: memory, disk: disk, battery: battery, isWarm: false
+            )
+        }
         let alpha = SystemMonitor.cpuSmoothingAlpha
         let cpu = SystemStatsMath.smoothed(previous: smoothedCPU, current: breakdown.total, alpha: alpha)
         let cpuUser = SystemStatsMath.smoothed(previous: smoothedCPUUser, current: breakdown.user, alpha: alpha)
@@ -797,6 +946,21 @@ class SystemMonitor {
         smoothedNetworkUp = netUp
         smoothedNetworkDown = netDown
 
+        return makeStats(
+            cpu: cpu, cpuUser: cpuUser, cpuSystem: cpuSystem,
+            cores: smoothedCores, netUp: netUp, netDown: netDown,
+            memory: memory, disk: disk, battery: battery, isWarm: true
+        )
+    }
+
+    private func makeStats(
+        cpu: Double, cpuUser: Double, cpuSystem: Double, cores: [Double],
+        netUp: Double, netDown: Double,
+        memory: (breakdown: SystemStatsMath.MemoryBreakdown, swapBytes: Double, pressureLevel: MemoryPressureLevel?),
+        disk: (percentage: Double, used: Double, total: Double, available: Double, purgeable: Double),
+        battery: (level: Int, isCharging: Bool, hasBattery: Bool, isPluggedIn: Bool, minutesRemaining: Int?),
+        isWarm: Bool
+    ) -> SystemStats {
         let gigabyte = 1_073_741_824.0
 
         return SystemStats(
@@ -819,7 +983,7 @@ class SystemMonitor {
             timestamp: Date(),
             cpuUser: cpuUser,
             cpuSystem: cpuSystem,
-            cpuCoreUsage: smoothedCores,
+            cpuCoreUsage: cores,
             memoryApp: memory.breakdown.appBytes / gigabyte,
             memoryWired: memory.breakdown.wiredBytes / gigabyte,
             memoryCompressed: memory.breakdown.compressedBytes / gigabyte,
@@ -828,7 +992,8 @@ class SystemMonitor {
             isPluggedIn: battery.isPluggedIn,
             batteryMinutesRemaining: battery.minutesRemaining,
             thermalLevel: ThermalLevel(ProcessInfo.processInfo.thermalState),
-            uptime: ProcessInfo.processInfo.systemUptime
+            uptime: ProcessInfo.processInfo.systemUptime,
+            isWarmSample: isWarm
         )
     }
 
@@ -1106,9 +1271,9 @@ enum DynamicIslandMath {
     /// Island. Expanded, it grows downward into a full card. Widths derive
     /// from the measured cutout when AppKit exposes both auxiliary areas.
     static let fallbackNotchWidth: CGFloat = 180
-    static let compactEarWidth: CGFloat = 66
-    static let expandedContentHeight: CGFloat = 168
-    static let expandedMinimumWidth: CGFloat = 470
+    static let compactEarWidth: CGFloat = 80
+    static let expandedContentHeight: CGFloat = 182
+    static let expandedMinimumWidth: CGFloat = 500
     static let expandedHorizontalPadding: CGFloat = 230
 
     /// Returns true when the screen has a physical notch.
